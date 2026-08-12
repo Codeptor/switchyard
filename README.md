@@ -66,6 +66,62 @@ For the Qwen Token Plan example in that guide, the matching WSL export is:
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616
 ```
 
+## CLI commands
+
+### `switchyard doctor`
+
+Pre-flight checks for config, credentials, provider reachability, and gateway
+health. Prints a table with PASS/WARN/FAIL markers. Exits 1 when the config is
+invalid or a required credential is missing; reachability failures are WARN
+and do not affect the exit code:
+
+```bash
+switchyard doctor
+switchyard doctor --config /path/to/config.json
+```
+
+### `switchyard models`
+
+Lists the model routes exposed by a running gateway:
+
+```bash
+switchyard models
+switchyard models --host 127.0.0.1 --port 3456 --token my-token
+```
+
+### `switchyard status`
+
+Shows gateway health, version, git SHA, and usage summary from a running
+instance:
+
+```bash
+switchyard status
+switchyard status --host 127.0.0.1 --port 3456
+```
+
+### `switchyard usage`
+
+Tabular per-provider, per-model, per-day usage counters from a running gateway:
+
+```bash
+switchyard usage --host 127.0.0.1 --port 3456
+```
+
+### `switchyard service install|uninstall`
+
+Manage a systemd user service unit for switchyard. `install` writes
+`~/.config/systemd/user/switchyard.service` and prints the follow-up
+`systemctl` commands; `uninstall` removes the unit file:
+
+```bash
+switchyard service install --config ~/.config/switchyard/config.json
+switchyard service uninstall
+```
+
+### `switchyard --version`
+
+Prints the version and embedded git short SHA: `0.1.0 (abc1234)`.
+
 ## Fallback routing
 
 Configure ordered fallback routes for transient upstream failures. When a
