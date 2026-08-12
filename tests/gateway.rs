@@ -200,6 +200,33 @@ async fn invalid_messages_return_anthropic_error_without_calling_backend() {
 }
 
 #[tokio::test]
+async fn invalid_stream_type_returns_bad_request_without_calling_backend() {
+    let backend = MockBackend::default();
+    let calls = Arc::clone(&backend.calls);
+    let app = Gateway::new(backend).router();
+    let request_body = json!({
+        "model": "kimi/kimi-k3[1m]",
+        "max_tokens": 64,
+        "stream": "true",
+        "messages": [{"role":"user","content":"hello"}]
+    });
+
+    let response = app
+        .oneshot(json_request("/v1/messages", &request_body))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("error json");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(calls.lock().expect("test mutex").is_empty());
+}
+
+#[tokio::test]
 async fn backend_errors_preserve_http_status_and_hide_credentials() {
     let backend = MockBackend::with_completion(Err(BackendError::upstream(
         StatusCode::TOO_MANY_REQUESTS,

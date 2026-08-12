@@ -140,10 +140,10 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Validate and normalize the config.
+    /// Validate the config.
     ///
     /// Normalization:
-    /// - trims whitespace from ids,
+    /// - rejects surrounding whitespace in ids,
     /// - rejects empty ids,
     /// - validates base_url scheme,
     /// - validates auth and models.
@@ -212,7 +212,7 @@ impl ProviderConfig {
 
 fn validate_provider_id(id: &str) -> Result<(), ConfigError> {
     let trimmed = id.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed != id {
         return Err(ConfigError::InvalidProviderId(id.to_string()));
     }
     if !trimmed
@@ -226,7 +226,7 @@ fn validate_provider_id(id: &str) -> Result<(), ConfigError> {
 
 fn validate_model_id(id: &str) -> Result<(), ConfigError> {
     let trimmed = id.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed != id {
         return Err(ConfigError::InvalidModelId(id.to_string()));
     }
     // Model IDs are provider-defined. Reject only whitespace/control characters
@@ -326,6 +326,37 @@ mod tests {
             extra_headers: vec![],
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_surrounding_whitespace_in_provider_and_model_ids() {
+        let provider = ProviderConfig {
+            id: " p1 ".to_string(),
+            base_url: url("https://example.com"),
+            auth: AuthConfig::None,
+            models: vec![],
+            timeout_ms: None,
+            default_model: None,
+            extra_headers: vec![],
+        };
+        assert!(provider.validate().is_err());
+
+        let model = ProviderConfig {
+            id: "p1".to_string(),
+            base_url: url("https://example.com"),
+            auth: AuthConfig::None,
+            models: vec![ModelConfig {
+                id: " m1 ".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities::default(),
+            }],
+            timeout_ms: None,
+            default_model: None,
+            extra_headers: vec![],
+        };
+        assert!(model.validate().is_err());
     }
 
     #[test]

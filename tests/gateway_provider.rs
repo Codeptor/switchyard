@@ -32,6 +32,7 @@ impl StubAdapter {
                 role: "assistant".to_string(),
                 content: vec![ContentBlock::Text {
                     text: "stub response".to_string(),
+                    extra: Default::default(),
                 }],
                 model: "model-one".to_string(),
                 stop_reason: Some(StopReason::EndTurn),
@@ -39,7 +40,9 @@ impl StubAdapter {
                 usage: Usage {
                     input_tokens: 2,
                     output_tokens: 3,
+                    extra: Default::default(),
                 },
+                extra: Default::default(),
             },
             events: vec![
                 StreamEvent::MessageStart {
@@ -48,6 +51,7 @@ impl StubAdapter {
                     usage: Usage {
                         input_tokens: 2,
                         output_tokens: 0,
+                        extra: Default::default(),
                     },
                 },
                 StreamEvent::ContentBlockDelta {

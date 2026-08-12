@@ -150,10 +150,12 @@ fn validate_request(body: &Value) -> Result<(String, bool), BackendError> {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .ok_or_else(|| BackendError::InvalidRequest("model is required".to_string()))?;
-    let stream = object
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let stream = match object.get("stream") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| BackendError::InvalidRequest("stream must be a boolean".to_string()))?,
+    };
     Ok((model.to_string(), stream))
 }
 
