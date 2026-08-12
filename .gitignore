@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.secret
+logs/
+tmp/
+dist/
+coverage/
+node_modules/
+target/
