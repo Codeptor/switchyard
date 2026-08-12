@@ -7,14 +7,20 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use switchyard::config::{SwitchyardConfig, default_config_path};
-use switchyard::gateway::{FallbackBackend, Gateway, ListenConfig, ProviderBackend};
+use switchyard::gateway::{
+    Backend, FallbackBackend, Gateway, HotBackend, ListenConfig, ProviderBackend, Telemetry,
+    TelemetryState, UsageSnapshotRow,
+};
 use switchyard::setup::{
-    ProviderPreset, apply_credentials, build_config, credentials_path, write_config,
-    write_credentials,
+    ProviderPreset, apply_credentials, build_config, credentials_path, load_credential_names,
+    reload_credentials, write_config, write_credentials,
 };
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Concrete backend stack: Telemetry → Fallback → Provider.
+type ConcreteBackend = Telemetry<FallbackBackend<ProviderBackend>>;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +39,8 @@ struct Cli {
 enum Command {
     /// Create a first-run config and optionally store provider credentials.
     Init(InitArgs),
+    /// Query usage statistics from a running gateway.
+    Usage(UsageArgs),
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +87,25 @@ struct InitArgs {
     no_credentials: bool,
 }
 
+#[derive(Debug, Args)]
+struct UsageArgs {
+    /// Gateway host to connect to.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Gateway port to connect to.
+    #[arg(long, default_value_t = 3456)]
+    port: u16,
+
+    /// Bearer token for authenticated gateways.
+    #[arg(long, env = "SWITCHYARD_TOKEN")]
+    token: Option<String>,
+
+    /// JSON configuration containing provider endpoints and model IDs.
+    #[arg(long, env = "SWITCHYARD_CONFIG", global = true)]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -91,6 +118,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Init(args)) => run_init(args),
+        Some(Command::Usage(args)) => run_usage(args),
         None => run_gateway(cli.run).await,
     }
 }
@@ -150,6 +178,89 @@ fn run_init(args: InitArgs) -> Result<()> {
         println!("  {}/{}", preset.id(), preset.models().join(", "));
     }
     Ok(())
+}
+
+fn run_usage(args: UsageArgs) -> Result<()> {
+    let url = format!("http://{}:{}/usage", args.host, args.port);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("unable to build HTTP client")?;
+    let mut req = client.get(&url);
+    if let Some(token) = &args.token {
+        req = req.bearer_auth(token);
+    }
+    let response = match req.send() {
+        Ok(resp) => resp,
+        Err(err) if err.is_connect() => {
+            eprintln!("gateway not reachable at {}:{}", args.host, args.port);
+            std::process::exit(1);
+        }
+        Err(err) => return Err(err).context("usage request failed"),
+    };
+    if !response.status().is_success() {
+        bail!("gateway returned status {}", response.status());
+    }
+    let rows: Vec<UsageSnapshotRow> = response.json().context("unable to parse usage response")?;
+    print_usage_table(&rows);
+    Ok(())
+}
+
+fn print_usage_table(rows: &[UsageSnapshotRow]) {
+    if rows.is_empty() {
+        println!("No usage recorded yet.");
+        return;
+    }
+
+    // Column widths
+    let w_prov = rows
+        .iter()
+        .map(|r| r.provider.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let w_model = rows.iter().map(|r| r.model.len()).max().unwrap_or(5).max(5);
+    let w_day = 10;
+
+    println!(
+        "{:<w_prov$}  {:<w_model$}  {:<w_day$}  {:>8}  {:>12}  {:>13}  {:>6}",
+        "provider", "model", "day", "requests", "input tokens", "output tokens", "errors"
+    );
+    println!(
+        "{}",
+        "-".repeat(w_prov + w_model + w_day + 8 + 12 + 13 + 6 + 12)
+    );
+
+    let mut total_requests: u64 = 0;
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut total_errors: u64 = 0;
+
+    for row in rows {
+        println!(
+            "{:<w_prov$}  {:<w_model$}  {:<w_day$}  {:>8}  {:>12}  {:>13}  {:>6}",
+            row.provider,
+            row.model,
+            row.day,
+            row.requests,
+            row.input_tokens,
+            row.output_tokens,
+            row.errors
+        );
+        total_requests += row.requests;
+        total_input += row.input_tokens;
+        total_output += row.output_tokens;
+        total_errors += row.errors;
+    }
+
+    println!(
+        "{}",
+        "-".repeat(w_prov + w_model + w_day + 8 + 12 + 13 + 6 + 12)
+    );
+    println!(
+        "{:<w_prov$}  {:<w_model$}  {:<w_day$}  {:>8}  {:>12}  {:>13}  {:>6}",
+        "TOTAL", "", "", total_requests, total_input, total_output, total_errors
+    );
 }
 
 fn selected_presets(args: &InitArgs) -> Result<Vec<ProviderPreset>> {
@@ -219,16 +330,11 @@ fn collect_credentials(presets: &[ProviderPreset]) -> Result<BTreeMap<String, St
     Ok(credentials)
 }
 
-async fn run_gateway(args: RunArgs) -> Result<()> {
-    let config_path = args.config.unwrap_or_else(default_config_path);
-    let credential_count = apply_credentials(credentials_path(&config_path))
-        .context("unable to load local credentials")?;
-    let config = SwitchyardConfig::load(&config_path).with_context(|| {
-        format!(
-            "unable to load Switchyard configuration from {}",
-            config_path.display()
-        )
-    })?;
+/// Build the full backend stack from a config.
+fn build_backend(
+    config: SwitchyardConfig,
+    telemetry_state: Arc<TelemetryState>,
+) -> Result<ConcreteBackend> {
     let aliases = config.aliases.clone();
     let fallbacks = config.fallbacks.clone();
     let registry = Arc::new(
@@ -236,6 +342,24 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
             .into_registry()
             .context("unable to initialize configured providers")?,
     );
+    let provider = ProviderBackend::new(registry, aliases);
+    let fallback = FallbackBackend::new(provider, fallbacks);
+    Ok(Telemetry::new(fallback, telemetry_state))
+}
+
+async fn run_gateway(args: RunArgs) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let cred_path = credentials_path(&config_path);
+    let credential_count =
+        apply_credentials(&cred_path).context("unable to load local credentials")?;
+    let tracked_creds =
+        load_credential_names(&cred_path).context("unable to read credential names")?;
+    let config = SwitchyardConfig::load(&config_path).with_context(|| {
+        format!(
+            "unable to load Switchyard configuration from {}",
+            config_path.display()
+        )
+    })?;
     let defaults = ListenConfig::default();
     let authenticated = args.token.is_some();
     let listen = ListenConfig::new(
@@ -255,9 +379,14 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
         );
     }
 
+    let telemetry_state = TelemetryState::new();
+    let backend = build_backend(config, Arc::clone(&telemetry_state))?;
+    let models = backend.models();
+    let hot = HotBackend::new(backend);
+
     info!(
         config = %config_path.display(),
-        providers = registry.len(),
+        providers = models.iter().map(|m| &m.id).collect::<Vec<_>>().len(),
         credentials_loaded = credential_count,
         address = %listen.socket_addr(),
         authenticated = authenticated,
@@ -265,25 +394,33 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(listen.socket_addr()).await?;
-    let backend = ProviderBackend::new(registry, aliases);
-    let backend = FallbackBackend::new(backend, fallbacks);
-    let mut gateway = Gateway::new(backend);
+    let mut gateway = Gateway::new(hot.clone()).with_telemetry(Arc::clone(&telemetry_state));
     if let Some(token) = args.token {
         gateway = gateway.with_token(token);
     }
     gateway
-        .serve_with_shutdown(listener, shutdown_signal())
+        .serve_with_shutdown(
+            listener,
+            reload_or_shutdown(hot, config_path, cred_path, tracked_creds, telemetry_state),
+        )
         .await
         .context("Switchyard server stopped")
 }
 
-async fn shutdown_signal() {
+/// Run the reload loop: SIGHUP reloads config, Ctrl-C/SIGTERM shuts down.
+async fn reload_or_shutdown(
+    hot: HotBackend<ConcreteBackend>,
+    config_path: PathBuf,
+    cred_path: PathBuf,
+    tracked_creds: Vec<String>,
+    telemetry_state: Arc<TelemetryState>,
+) {
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install ctrl-c handler");
     };
-
     let terminate = async {
         signal(SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
@@ -291,8 +428,61 @@ async fn shutdown_signal() {
             .await;
     };
 
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
+    tokio::pin!(ctrl_c);
+    tokio::pin!(terminate);
+
+    loop {
+        tokio::select! {
+            () = &mut ctrl_c => break,
+            () = &mut terminate => break,
+            _ = sighup.recv() => {
+                info!("SIGHUP received, reloading configuration");
+                if let Err(err) = do_reload(
+                    &hot,
+                    &config_path,
+                    &cred_path,
+                    &tracked_creds,
+                    &telemetry_state,
+                ) {
+                    error!(error = %err, "reload failed, keeping previous configuration");
+                }
+            }
+        }
     }
+}
+
+fn do_reload(
+    hot: &HotBackend<ConcreteBackend>,
+    config_path: &PathBuf,
+    cred_path: &PathBuf,
+    tracked_creds: &[String],
+    telemetry_state: &Arc<TelemetryState>,
+) -> Result<()> {
+    // Reload credentials — only update vars we originally loaded from the file.
+    let cred_updated =
+        reload_credentials(cred_path, tracked_creds).context("unable to reload credentials")?;
+
+    // Reload config
+    let config = SwitchyardConfig::load(config_path)
+        .with_context(|| format!("unable to reload config from {}", config_path.display()))?;
+
+    let model_count = config
+        .providers
+        .iter()
+        .map(|p| p.models.len())
+        .sum::<usize>();
+    let provider_count = config.providers.len();
+
+    // Build new backend stack with the shared telemetry state
+    let new_backend = build_backend(config, Arc::clone(telemetry_state))?;
+    hot.swap(new_backend);
+
+    info!(
+        providers = provider_count,
+        models = model_count,
+        credentials_updated = cred_updated,
+        "configuration reloaded successfully"
+    );
+    info!("listener host/port and auth token unchanged");
+    Ok(())
 }

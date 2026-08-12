@@ -224,6 +224,51 @@ pub fn apply_credentials(path: impl AsRef<Path>) -> Result<usize, SetupError> {
     Ok(applied)
 }
 
+/// Names of the credential env vars loaded from a credentials file.
+/// Used by the SIGHUP reload path to know which vars it owns.
+pub fn load_credential_names(path: impl AsRef<Path>) -> Result<Vec<String>, SetupError> {
+    let path = path.as_ref();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SetupError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let file: CredentialsFile = serde_json::from_str(&contents)?;
+    Ok(file.credentials.into_keys().collect())
+}
+
+/// Reload credentials from the file, updating only the vars that were
+/// originally loaded from it (tracked by name). Vars the caller set in
+/// their environment are never touched.
+pub fn reload_credentials(path: impl AsRef<Path>, tracked: &[String]) -> Result<usize, SetupError> {
+    let path = path.as_ref();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(SetupError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let file: CredentialsFile = serde_json::from_str(&contents)?;
+    let mut updated = 0;
+    for name in tracked {
+        if let Some(value) = file.credentials.get(name) {
+            // SAFETY: only updating vars we know we loaded from the file.
+            unsafe { std::env::set_var(name, value) };
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
 fn valid_environment_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
