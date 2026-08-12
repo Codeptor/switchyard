@@ -40,7 +40,7 @@ impl Backend for MockBackend {
         ]
     }
 
-    fn complete(&self, request: BackendRequest) -> BackendFuture<Value> {
+    fn complete(&self, request: BackendRequest) -> BackendFuture<'_, Value> {
         let calls = Arc::clone(&self.calls);
         let completion = self
             .completion
@@ -52,7 +52,7 @@ impl Backend for MockBackend {
         })
     }
 
-    fn stream(&self, request: BackendRequest) -> BackendFuture<BackendStream> {
+    fn stream(&self, request: BackendRequest) -> BackendFuture<'_, BackendStream> {
         let calls = Arc::clone(&self.calls);
         let events = self.events.clone();
         Box::pin(async move {

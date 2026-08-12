@@ -108,7 +108,7 @@ impl BackendError {
 }
 
 /// Future returned by a backend operation.
-pub type BackendFuture<T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send>>;
+pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BackendError>> + Send + 'a>>;
 
 /// Normalized streaming events. Each value must be an Anthropic event object
 /// containing a string `type` field.
@@ -117,8 +117,8 @@ pub type BackendStream = Pin<Box<dyn Stream<Item = Result<Value, BackendError>> 
 /// Backend port consumed by the Claude Code gateway.
 pub trait Backend: Send + Sync + 'static {
     fn models(&self) -> Vec<ModelInfo>;
-    fn complete(&self, request: BackendRequest) -> BackendFuture<Value>;
-    fn stream(&self, request: BackendRequest) -> BackendFuture<BackendStream>;
+    fn complete(&self, request: BackendRequest) -> BackendFuture<'_, Value>;
+    fn stream(&self, request: BackendRequest) -> BackendFuture<'_, BackendStream>;
 }
 
 fn sanitize_message(message: &str) -> String {

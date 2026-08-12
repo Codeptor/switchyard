@@ -1,0 +1,45 @@
+{
+  "providers": [
+    {
+      "id": "kimi",
+      "base_url": "https://api.moonshot.ai/anthropic",
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "env_var": "MOONSHOT_API_KEY",
+        "prefix": "Bearer "
+      },
+      "models": [
+        { "id": "kimi-k3[1m]" }
+      ]
+    },
+    {
+      "id": "muse",
+      "base_url": "https://api.meta.ai",
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "env_var": "MODEL_API_KEY",
+        "prefix": "Bearer "
+      },
+      "models": [
+        { "id": "muse-spark-1.2-contributor" }
+      ]
+    },
+    {
+      "id": "qwen",
+      "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "env_var": "QWEN_API_KEY",
+        "prefix": "Bearer "
+      },
+      "models": [
+        { "id": "qwen3.8-max" },
+        { "id": "qwen3.7-max" },
+        { "id": "qwen3.6-flash" }
+      ]
+    }
+  ]
+}

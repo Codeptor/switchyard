@@ -229,11 +229,9 @@ fn validate_model_id(id: &str) -> Result<(), ConfigError> {
     if trimmed.is_empty() {
         return Err(ConfigError::InvalidModelId(id.to_string()));
     }
-    // Model IDs are provider-defined; allow alphanumerics, -, _, ., :, /
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '@'))
-    {
+    // Model IDs are provider-defined. Reject only whitespace/control characters
+    // so suffixes such as Qwen/Kimi's `[1m]` remain valid.
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(ConfigError::InvalidModelId(id.to_string()));
     }
     Ok(())
