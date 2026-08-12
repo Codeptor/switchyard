@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 
 use switchyard::providers::{
     AnthropicAdapter, AuthConfig, ModelCapabilities, ModelConfig, ProviderAdapter, ProviderConfig,
-    ProviderError, ProviderRegistry,
+    ProviderError, ProviderRegistry, RetryConfig,
     types::{ContentBlock, Message, MessageContent, MessagesRequest, StopReason},
 };
 
@@ -113,9 +113,11 @@ fn malformed_provider_id_rejected() {
         base_url: "https://example.test".parse().expect("url"),
         auth: AuthConfig::None,
         models: vec![],
-        timeout_ms: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     assert!(cfg.validate().is_err());
 }
@@ -129,9 +131,11 @@ fn malformed_base_url_rejected() {
             .expect("url parses but invalid scheme"),
         auth: AuthConfig::None,
         models: vec![],
-        timeout_ms: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     assert!(cfg.validate().is_err());
 }
@@ -158,9 +162,11 @@ fn duplicate_model_id_rejected() {
                 capabilities: ModelCapabilities::default(),
             },
         ],
-        timeout_ms: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     assert!(cfg.validate().is_err());
 }
@@ -173,9 +179,11 @@ fn registry_rejects_duplicate_provider() {
         base_url: "https://example.test".parse().expect("url"),
         auth: AuthConfig::None,
         models: vec![],
-        timeout_ms: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     let cfg2 = cfg1.clone();
     reg.register_anthropic(cfg1).expect("first");
@@ -223,9 +231,11 @@ async fn missing_credential_returns_auth_error() {
             max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         }],
-        timeout_ms: Some(2000),
+        connect_timeout_ms: None,
+        read_timeout_ms: Some(2000),
         default_model: Some("m1".to_string()),
         extra_headers: vec![],
+        retry: None,
     };
 
     // Ensure env var is not set.
@@ -294,9 +304,11 @@ async fn credential_with_prefix_builds_bearer_header() {
             max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         }],
-        timeout_ms: Some(2000),
+        connect_timeout_ms: None,
+        read_timeout_ms: Some(2000),
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     let adapter = AnthropicAdapter::from_config(&cfg).expect("adapter");
     let req = sample_request("m1", false);
@@ -682,9 +694,11 @@ fn no_discovery_needed_any_model_id_accepted_when_empty() {
         base_url: "https://example.test".parse().expect("url"),
         auth: AuthConfig::None,
         models: vec![], // no models pre-configured
-        timeout_ms: None,
+        connect_timeout_ms: None,
+        read_timeout_ms: None,
         default_model: None,
         extra_headers: vec![],
+        retry: None,
     };
     reg.register_anthropic(cfg).expect("register");
     // Any model id should resolve.
@@ -692,4 +706,463 @@ fn no_discovery_needed_any_model_id_accepted_when_empty() {
         .resolve("generic-prov", Some("arbitrary-model-xyz"))
         .expect("resolve any");
     assert_eq!(h.model_id, "arbitrary-model-xyz");
+}
+
+// ---------------------------------------------------------------------------
+// F1: connect + read timeout tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_zero_connect_timeout() {
+    let cfg = ProviderConfig {
+        id: "p1".to_string(),
+        base_url: "https://example.test".parse().expect("url"),
+        auth: AuthConfig::None,
+        models: vec![],
+        connect_timeout_ms: Some(0),
+        read_timeout_ms: Some(5000),
+        default_model: None,
+        extra_headers: vec![],
+        retry: None,
+    };
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn config_rejects_zero_read_timeout() {
+    let cfg = ProviderConfig {
+        id: "p1".to_string(),
+        base_url: "https://example.test".parse().expect("url"),
+        auth: AuthConfig::None,
+        models: vec![],
+        connect_timeout_ms: Some(5000),
+        read_timeout_ms: Some(0),
+        default_model: None,
+        extra_headers: vec![],
+        retry: None,
+    };
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn config_accepts_valid_connect_and_read_timeouts() {
+    let cfg = ProviderConfig {
+        id: "p1".to_string(),
+        base_url: "https://example.test".parse().expect("url"),
+        auth: AuthConfig::None,
+        models: vec![],
+        connect_timeout_ms: Some(5000),
+        read_timeout_ms: Some(120000),
+        default_model: None,
+        extra_headers: vec![],
+        retry: None,
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[tokio::test]
+async fn stream_completes_when_chunk_gaps_below_read_timeout() {
+    // The stream takes ~600ms total (3 chunks, 100ms gaps) but each individual
+    // gap is well under the 400ms read_timeout, so it should succeed.
+    use axum::body::Body;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let chunks: Vec<(Duration, String)> = vec![
+        (
+            Duration::from_millis(0),
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+                .to_string(),
+        ),
+        (
+            Duration::from_millis(100),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+                .to_string(),
+        ),
+        (
+            Duration::from_millis(100),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ),
+    ];
+
+    let chunks = Arc::new(Mutex::new(chunks));
+
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        post(move |_: axum::http::HeaderMap, _: String| {
+            let chunks = chunks.clone();
+            async move {
+                let stream = futures_util::stream::unfold(chunks, |chunks| async move {
+                    let mut guard = chunks.lock().await;
+                    if guard.is_empty() {
+                        return None;
+                    }
+                    let (delay, data) = guard.remove(0);
+                    drop(guard);
+                    tokio::time::sleep(delay).await;
+                    Some((Ok::<_, std::convert::Infallible>(data), chunks))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .expect("response")
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // read_timeout = 400ms, gaps = 100ms each (well under), total ~200ms
+    let adapter = AnthropicAdapter::with_timeouts(
+        "prov-read-timeout-ok",
+        format!("http://{addr}"),
+        AuthConfig::None,
+        Duration::from_secs(5),
+        Duration::from_millis(400),
+    )
+    .expect("adapter");
+
+    let mut stream = adapter
+        .stream(sample_request("m1", true))
+        .await
+        .expect("stream should start");
+
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event should be ok"));
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, switchyard::providers::StreamEvent::MessageStop))
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stream_stall_exceeds_read_timeout_produces_timeout_error() {
+    use axum::body::Body;
+
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        post(|_: axum::http::HeaderMap, _: String| async {
+            // Send one chunk, then stall for 600ms (exceeds 200ms read timeout).
+            let stream = futures_util::stream::unfold(0u32, |state| async move {
+                if state == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(
+                            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"
+                                .to_string(),
+                        ),
+                        state + 1,
+                    ))
+                } else if state == 1 {
+                    // Stall longer than read_timeout.
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    Some((
+                        Ok("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string()),
+                        state + 1,
+                    ))
+                } else {
+                    None
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .expect("response")
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = AnthropicAdapter::with_timeouts(
+        "prov-read-timeout-stall",
+        format!("http://{addr}"),
+        AuthConfig::None,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    )
+    .expect("adapter");
+
+    let mut stream = adapter
+        .stream(sample_request("m1", true))
+        .await
+        .expect("stream should start");
+
+    let mut got_timeout = false;
+    while let Some(ev) = stream.next().await {
+        if let Err(ProviderError::Timeout { .. }) = ev {
+            got_timeout = true;
+            break;
+        }
+    }
+
+    assert!(got_timeout, "expected timeout error from read stall");
+    handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// F4: retry tests
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+async fn spawn_counting_mock<F, R>(counter: Arc<AtomicU32>, handler: F) -> MockServer
+where
+    F: Fn(HeaderMap, String) -> R + Clone + Send + Sync + 'static,
+    R: IntoResponse + Send + 'static,
+{
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |headers: HeaderMap, body: String| {
+            let h = handler.clone();
+            let c = counter.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                h(headers, body).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("addr");
+    let _handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve mock");
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    MockServer { addr, _handle }
+}
+
+#[tokio::test]
+async fn retry_429_then_200_succeeds_with_retry_after() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = counter.clone();
+
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |_headers: HeaderMap, _body: String| {
+            let c = c.clone();
+            async move {
+                let count = c.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", "1")
+                        .body(Body::from(
+                            serde_json::json!({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}).to_string()
+                        ))
+                        .expect("response")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id":"msg_1","type":"message","role":"assistant",
+                                "content":[{"type":"text","text":"ok"}],
+                                "model":"m1","stop_reason":"end_turn",
+                                "usage":{"input_tokens":1,"output_tokens":1}
+                            }).to_string()
+                        ))
+                        .expect("response")
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-retry-429",
+        format!("http://{addr}"),
+        AuthConfig::None,
+        Duration::from_millis(5000),
+    )
+    .expect("adapter")
+    .with_retry(RetryConfig {
+        max_retries: 2,
+        base_delay_ms: 50,
+        max_delay_ms: 200,
+    });
+
+    let res = adapter.complete(sample_request("m1", false)).await;
+    assert!(res.is_ok(), "should succeed after retry: {res:?}");
+
+    // Exactly 2 upstream hits (1 initial + 1 retry).
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn retry_persistent_500_fails_after_max_retries() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_clone = counter.clone();
+
+    let server = spawn_counting_mock(counter_clone, |_: HeaderMap, _: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"type":"error","error":{"type":"api_error","message":"server error"}})
+                .to_string(),
+        )
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-retry-500",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(5000),
+    )
+    .expect("adapter")
+    .with_retry(RetryConfig {
+        max_retries: 2,
+        base_delay_ms: 50,
+        max_delay_ms: 200,
+    });
+
+    let err = adapter
+        .complete(sample_request("m1", false))
+        .await
+        .expect_err("should fail");
+
+    match err {
+        ProviderError::Upstream { status, .. } => assert_eq!(status, 500),
+        other => panic!("expected Upstream error, got: {other:?}"),
+    }
+
+    // max_retries + 1 = 3 total attempts.
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn retry_401_does_not_retry() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_clone = counter.clone();
+
+    let server = spawn_counting_mock(counter_clone, |_: HeaderMap, _: String| {
+        (
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"type":"error","error":{"type":"authentication_error","message":"bad key"}})
+                .to_string(),
+        )
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-no-retry-401",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(5000),
+    )
+    .expect("adapter")
+    .with_retry(RetryConfig {
+        max_retries: 3,
+        base_delay_ms: 50,
+        max_delay_ms: 200,
+    });
+
+    let err = adapter
+        .complete(sample_request("m1", false))
+        .await
+        .expect_err("should fail");
+
+    assert!(matches!(err, ProviderError::Upstream { status: 401, .. }));
+    // Exactly 1 attempt — no retries for 401.
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retry_stream_path_retries_pre_stream_failure() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = counter.clone();
+
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |_headers: HeaderMap, _body: String| {
+            let c = c.clone();
+            async move {
+                let count = c.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::from(
+                            serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}).to_string()
+                        ))
+                        .expect("response")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            concat!(
+                                "event: message_start\n",
+                                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"model\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                                "event: message_stop\n",
+                                "data: {\"type\":\"message_stop\"}\n\n",
+                            )
+                            .to_string()
+                        ))
+                        .expect("response")
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-retry-stream",
+        format!("http://{addr}"),
+        AuthConfig::None,
+        Duration::from_millis(5000),
+    )
+    .expect("adapter")
+    .with_retry(RetryConfig {
+        max_retries: 2,
+        base_delay_ms: 50,
+        max_delay_ms: 200,
+    });
+
+    let mut stream = adapter
+        .stream(sample_request("m1", true))
+        .await
+        .expect("stream should succeed after retry");
+
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event ok"));
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, switchyard::providers::StreamEvent::MessageStart { .. }))
+    );
+
+    // 2 attempts (1 initial 503 + 1 successful retry).
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
 }

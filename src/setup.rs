@@ -90,9 +90,11 @@ impl ProviderPreset {
                     capabilities: ModelCapabilities::default(),
                 })
                 .collect(),
-            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
             default_model: Some(default_model.to_string()),
             extra_headers: vec![],
+            retry: None,
         }
     }
 }
