@@ -44,6 +44,30 @@ For the Qwen Token Plan example in that guide, the matching WSL export is:
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616
 ```
 
+## Provider compatibility
+
+The adapter sends `POST {base_url}/v1/messages`, adds the Anthropic version
+header, and uses the auth header declared in `config.json`. The example bases
+are deliberately the provider roots so the adapter owns the `/v1/messages`
+suffix:
+
+- Kimi K3: `https://api.moonshot.ai/anthropic`
+- Muse Spark: `https://api.meta.ai`
+- QwenCloud Token Plan: `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic`
+
+The wire boundary forwards provider-specific request fields, unknown content
+blocks, thinking/signature stream deltas, and provider usage counters. That is
+needed for Qwen thinking mode and keeps the same adapter usable for Muse and
+Kimi extensions. Qwen documents both `Authorization: Bearer ...` and
+`x-api-key`; if an account requires the latter, change only that provider's
+`auth.header` to `x-api-key` and set `prefix` to `null`.
+
+Useful upstream references:
+
+- [QwenCloud Claude Code integration](https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code)
+- [Moonshot Kimi API](https://platform.kimi.ai/docs/api/chat)
+- [Meta Muse Spark API announcement](https://ai.meta.com/blog/introducing-muse-spark-meta-model-api/)
+
 ## Worktrees
 
 - `switchyard` — integration baseline
