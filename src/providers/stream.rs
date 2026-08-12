@@ -3,6 +3,8 @@
 //! Normalizes upstream streaming chunks into typed [`StreamEvent`]s.
 //! Also re-exports a helper to produce an Anthropic SSE byte stream.
 
+use serde::de::{Deserializer, Error as _};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -45,8 +47,7 @@ pub enum StreamEvent {
 }
 
 /// Delta payload inside `content_block_delta`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Delta {
     TextDelta {
         text: String,
@@ -54,9 +55,76 @@ pub enum Delta {
     InputJsonDelta {
         partial_json: String,
     },
-    // Passthrough for future delta types.
-    #[serde(other)]
-    Unknown,
+    ThinkingDelta {
+        thinking: String,
+    },
+    SignatureDelta {
+        signature: String,
+    },
+    /// Preserve delta types introduced by a provider or newer API.
+    Unknown(Value),
+}
+
+impl Serialize for Delta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = match self {
+            Self::TextDelta { text } => serde_json::json!({
+                "type": "text_delta",
+                "text": text,
+            }),
+            Self::InputJsonDelta { partial_json } => serde_json::json!({
+                "type": "input_json_delta",
+                "partial_json": partial_json,
+            }),
+            Self::ThinkingDelta { thinking } => serde_json::json!({
+                "type": "thinking_delta",
+                "thinking": thinking,
+            }),
+            Self::SignatureDelta { signature } => serde_json::json!({
+                "type": "signature_delta",
+                "signature": signature,
+            }),
+            Self::Unknown(value) => value.clone(),
+        };
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Delta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            return Ok(Self::Unknown(value));
+        };
+        let field = |name: &str| {
+            value
+                .get(name)
+                .cloned()
+                .ok_or_else(|| D::Error::custom(format!("delta {kind:?} is missing {name:?}")))
+        };
+        match kind {
+            "text_delta" => Ok(Self::TextDelta {
+                text: serde_json::from_value(field("text")?).map_err(D::Error::custom)?,
+            }),
+            "input_json_delta" => Ok(Self::InputJsonDelta {
+                partial_json: serde_json::from_value(field("partial_json")?)
+                    .map_err(D::Error::custom)?,
+            }),
+            "thinking_delta" => Ok(Self::ThinkingDelta {
+                thinking: serde_json::from_value(field("thinking")?).map_err(D::Error::custom)?,
+            }),
+            "signature_delta" => Ok(Self::SignatureDelta {
+                signature: serde_json::from_value(field("signature")?).map_err(D::Error::custom)?,
+            }),
+            _ => Ok(Self::Unknown(value)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +187,7 @@ pub fn parse_sse_buffer(text: &str) -> Vec<SseEvent> {
 /// Incremental SSE parser that handles chunked `bytes` delivery.
 #[derive(Debug, Default)]
 pub struct SseParser {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseParser {
@@ -127,35 +195,38 @@ impl SseParser {
         Self::default()
     }
 
-    /// Feed raw bytes (UTF-8 lossy) and extract any complete events.
+    /// Feed raw bytes and extract any complete events.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        let text = String::from_utf8_lossy(chunk);
-        self.buf.push_str(&text);
+        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        // Events are delimited by double newline.
-        while let Some(pos) = self.buf.find("\n\n") {
-            let frame = self.buf[..pos].to_string();
-            self.buf.drain(..pos + 2);
-            out.extend(parse_sse_buffer(&(frame + "\n\n")));
-        }
-        // Also handle CRLF variants.
-        while let Some(pos) = self.buf.find("\r\n\r\n") {
-            let frame = self.buf[..pos].to_string();
-            self.buf.drain(..pos + 4);
-            out.extend(parse_sse_buffer(&(frame + "\n\n")));
+        while let Some((pos, delimiter_len)) = find_sse_delimiter(&self.buf) {
+            let frame = self.buf[..pos].to_vec();
+            self.buf.drain(..pos + delimiter_len);
+            let frame = String::from_utf8_lossy(&frame);
+            out.extend(parse_sse_buffer(&format!("{frame}\n\n")));
         }
         out
     }
 
     /// Drain any trailing buffered data as a final event (non-standard but useful for tests).
     pub fn flush(&mut self) -> Vec<SseEvent> {
-        if self.buf.trim().is_empty() {
+        if self.buf.iter().all(u8::is_ascii_whitespace) {
             self.buf.clear();
             return vec![];
         }
         let taken = std::mem::take(&mut self.buf);
-        parse_sse_buffer(&taken)
+        let text = String::from_utf8_lossy(&taken);
+        parse_sse_buffer(&text)
     }
+}
+
+fn find_sse_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    buf.windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|pos| (pos, 2))
 }
 
 /// Normalize a raw `SseEvent` into a typed [`StreamEvent`].
@@ -222,7 +293,8 @@ pub fn normalize_sse_event(raw: &SseEvent) -> Option<StreamEvent> {
         "content_block_delta" => {
             let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let delta_val = value.get("delta")?.clone();
-            let delta: Delta = serde_json::from_value(delta_val).unwrap_or(Delta::Unknown);
+            let delta: Delta =
+                serde_json::from_value(delta_val.clone()).unwrap_or(Delta::Unknown(delta_val));
             Some(StreamEvent::ContentBlockDelta { index, delta })
         }
         "content_block_stop" => {
@@ -311,5 +383,56 @@ mod tests {
         assert_eq!(events.len(), 2);
         let norm: Vec<_> = events.iter().filter_map(normalize_sse_event).collect();
         assert_eq!(norm.len(), 2);
+    }
+
+    #[test]
+    fn parses_thinking_delta_without_dropping_it() {
+        let raw = SseEvent {
+            event: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}"#.to_string(),
+        };
+
+        let event = normalize_sse_event(&raw).expect("thinking event");
+        let StreamEvent::ContentBlockDelta { delta, .. } = event else {
+            panic!("expected content block delta");
+        };
+        assert_eq!(
+            serde_json::to_value(delta).expect("wire delta"),
+            serde_json::json!({"type": "thinking_delta", "thinking": "reason"})
+        );
+    }
+
+    #[test]
+    fn preserves_utf8_split_across_network_chunks() {
+        let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"café\"}}\n\n";
+        let split = sse.find('é').expect("accented character") + 1;
+        let mut parser = SseParser::new();
+        let mut events = parser.feed(&sse.as_bytes()[..split]);
+        events.extend(parser.feed(&sse.as_bytes()[split..]));
+
+        let Some(StreamEvent::ContentBlockDelta {
+            delta: Delta::TextDelta { text },
+            ..
+        }) = events.iter().filter_map(normalize_sse_event).next()
+        else {
+            panic!("expected text delta");
+        };
+        assert_eq!(text, "café");
+    }
+
+    #[test]
+    fn preserves_unknown_delta_types() {
+        let raw = SseEvent {
+            event: Some("content_block_delta".to_string()),
+            data: r#"{"type":"content_block_delta","index":0,"delta":{"type":"provider_delta","value":42}}"#.to_string(),
+        };
+        let event = normalize_sse_event(&raw).expect("unknown delta event");
+        let StreamEvent::ContentBlockDelta { delta, .. } = event else {
+            panic!("expected content block delta");
+        };
+        assert_eq!(
+            serde_json::to_value(delta).expect("wire delta"),
+            serde_json::json!({"type": "provider_delta", "value": 42})
+        );
     }
 }

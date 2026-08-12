@@ -75,6 +75,7 @@ fn sample_request(model: &str, stream: bool) -> MessagesRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: MessageContent::Text("hello".to_string()),
+            extra: Default::default(),
         }],
         max_tokens: 256,
         system: None,
@@ -86,6 +87,7 @@ fn sample_request(model: &str, stream: bool) -> MessagesRequest {
         tools: None,
         tool_choice: None,
         metadata: None,
+        extra: Default::default(),
     }
 }
 
@@ -95,6 +97,7 @@ fn sample_tool_request(model: &str) -> MessagesRequest {
         name: "lookup".to_string(),
         description: Some("lookup data".to_string()),
         input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+        extra: Default::default(),
     }]);
     req
 }
@@ -546,6 +549,59 @@ async fn complete_with_tool_use_normalized() {
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "lookup"))
     );
+}
+
+#[tokio::test]
+async fn complete_preserves_thinking_fields_for_anthropic_compatible_providers() {
+    let server = spawn_mock(|_, body: String| {
+        let body: serde_json::Value = serde_json::from_str(&body).expect("request json");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 4096})
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "msg-thinking",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type":"thinking","thinking":"inspect the tool result","signature":"sig"},
+                    {"type":"text","text":"done"}
+                ],
+                "model": "qwen3.8-max",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":5,"output_tokens":10,"cache_read_input_tokens":2}
+            })
+            .to_string(),
+        )
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-thinking",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(2000),
+    )
+    .expect("adapter");
+    let mut request = sample_request("qwen3.8-max", false);
+    request.extra.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "enabled", "budget_tokens": 4096}),
+    );
+    request
+        .extra
+        .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+
+    let response = adapter.complete(request).await.expect("complete");
+    assert!(response.content.iter().any(|block| matches!(
+        block,
+        ContentBlock::Thinking { thinking, signature: Some(signature), .. }
+            if thinking == "inspect the tool result" && signature == "sig"
+    )));
+    assert_eq!(response.usage.extra["cache_read_input_tokens"], 2);
 }
 
 // ---------------------------------------------------------------------------
