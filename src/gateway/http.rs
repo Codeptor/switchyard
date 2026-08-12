@@ -194,7 +194,14 @@ async fn bearer_auth_middleware<B: Backend>(
         Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
             next.run(request).await
         }
-        _ => auth_error_response(),
+        _ => {
+            let request_id = request
+                .extensions()
+                .get::<String>()
+                .cloned()
+                .unwrap_or_default();
+            auth_error_response(&request_id)
+        }
     }
 }
 
@@ -208,7 +215,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-fn auth_error_response() -> Response {
+fn auth_error_response(request_id: &str) -> Response {
     let error = BackendError::upstream(
         401u16,
         "authentication_error",
@@ -216,7 +223,7 @@ fn auth_error_response() -> Response {
     );
     let body = ErrorResponse {
         kind: "error",
-        request_id: String::new(),
+        request_id: request_id.to_string(),
         error: ErrorDetail {
             kind: "authentication_error".to_string(),
             message: error.public_message(),
@@ -224,6 +231,11 @@ fn auth_error_response() -> Response {
     };
     let mut response = axum::Json(body).into_response();
     *response.status_mut() = StatusCode::UNAUTHORIZED;
+    if !request_id.is_empty()
+        && let Ok(value) = HeaderValue::from_str(request_id)
+    {
+        response.headers_mut().insert("x-request-id", value);
+    }
     response
 }
 
@@ -313,6 +325,7 @@ async fn messages<B: Backend>(
 
     info!(request_id = id, model = %model, stream = stream, "request started");
 
+    let model_name = model.clone();
     let request = BackendRequest {
         model,
         body,
@@ -323,6 +336,7 @@ async fn messages<B: Backend>(
             Ok(events) => {
                 info!(
                     request_id = id,
+                    model = %model_name,
                     status = 200u16,
                     latency_ms = start.elapsed().as_millis() as u64,
                     "request completed"
@@ -334,6 +348,7 @@ async fn messages<B: Backend>(
                 let resp = error_response(&error, id);
                 info!(
                     request_id = id,
+                    model = %model_name,
                     status,
                     latency_ms = start.elapsed().as_millis() as u64,
                     "request completed"
@@ -346,6 +361,7 @@ async fn messages<B: Backend>(
             Ok(body) => {
                 info!(
                     request_id = id,
+                    model = %model_name,
                     status = 200u16,
                     latency_ms = start.elapsed().as_millis() as u64,
                     "request completed"
@@ -357,6 +373,7 @@ async fn messages<B: Backend>(
                 let resp = error_response(&error, id);
                 info!(
                     request_id = id,
+                    model = %model_name,
                     status,
                     latency_ms = start.elapsed().as_millis() as u64,
                     "request completed"

@@ -971,6 +971,49 @@ async fn auth_missing_token_returns_401() {
 }
 
 #[tokio::test]
+async fn auth_401_body_contains_request_id() {
+    let app = Gateway::new(MockBackend::default())
+        .with_token("secret-token".to_string())
+        .router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-request-id", "test-req-id-401")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "kimi/kimi-k3[1m]",
+                        "messages": [{"role":"user","content":"hi"}]
+                    }))
+                    .expect("json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-id")
+            .expect("x-request-id header")
+            .to_str()
+            .expect("header value"),
+        "test-req-id-401"
+    );
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["request_id"], "test-req-id-401");
+}
+
+#[tokio::test]
 async fn auth_wrong_token_returns_401() {
     let app = Gateway::new(MockBackend::default())
         .with_token("secret-token".to_string())
