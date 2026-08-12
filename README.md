@@ -66,6 +66,39 @@ For the Qwen Token Plan example in that guide, the matching WSL export is:
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616
 ```
 
+## Fallback routing
+
+Configure ordered fallback routes for transient upstream failures. When a
+request returns 429, 500, 502, 503, 529, or the provider is unreachable, the
+gateway retries each fallback target in order:
+
+```json
+{
+  "providers": [ ... ],
+  "fallbacks": {
+    "kimi/kimi-k3[1m]": ["qwen/qwen3.8-max", "muse/muse-spark-1.2-contributor"]
+  }
+}
+```
+
+Client errors (400, 401, 403, 404) and model-not-found responses pass through
+without fallback. For streaming requests, fallback only applies to stream
+creation failures — mid-stream errors are not retried.
+
+## Authentication
+
+Pass `--token <secret>` (or set `SWITCHYARD_TOKEN`) to require
+`Authorization: Bearer <token>` on `/v1/*` routes. The `/health` endpoint
+stays open. When a token is configured, non-loopback bind addresses are
+permitted:
+
+```bash
+switchyard --host 0.0.0.0 --port 3456 --token my-secret-token
+```
+
+Without `--token`, the gateway refuses non-loopback binds to keep provider
+credentials local.
+
 ## Provider compatibility
 
 The adapter sends `POST {base_url}/v1/messages`, adds the Anthropic version
