@@ -230,6 +230,8 @@ fn auth_error_response() -> Response {
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,7 +256,11 @@ struct ErrorDetail {
 }
 
 async fn health() -> impl IntoResponse {
-    axum::Json(HealthResponse { status: "ok" })
+    axum::Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        git_sha: env!("SWITCHYARD_GIT_SHA"),
+    })
 }
 
 async fn models<B: Backend>(State(state): State<AppState<B>>) -> impl IntoResponse {
