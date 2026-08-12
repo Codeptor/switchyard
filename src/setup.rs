@@ -117,6 +117,7 @@ pub fn build_config(presets: &[ProviderPreset]) -> SwitchyardConfig {
     SwitchyardConfig {
         providers,
         aliases: BTreeMap::new(),
+        fallbacks: BTreeMap::new(),
     }
 }
 

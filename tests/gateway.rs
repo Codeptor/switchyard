@@ -7,7 +7,8 @@ use axum::http::{Request, StatusCode};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use switchyard::gateway::{
-    Backend, BackendError, BackendFuture, BackendRequest, BackendStream, Gateway, ModelInfo,
+    Backend, BackendError, BackendFuture, BackendRequest, BackendStream, FallbackBackend, Gateway,
+    ModelInfo,
 };
 use tokio::sync::broadcast;
 use tower::ServiceExt;
@@ -665,3 +666,278 @@ async fn non_allowlisted_headers_are_not_forwarded() {
         "non-allowlisted headers must not be forwarded"
     );
 }
+
+// ── F5: fallback routing ─────────────────────────────────────────────
+
+#[derive(Clone)]
+struct RoutingMockBackend {
+    responses: Arc<std::collections::BTreeMap<String, MockResponse>>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone)]
+enum MockResponse {
+    CompleteOk(Value),
+    CompleteErr(BackendError),
+    StreamOk(Vec<Result<Value, BackendError>>),
+    StreamErr(BackendError),
+}
+
+impl RoutingMockBackend {
+    fn new() -> Self {
+        Self {
+            responses: Arc::new(std::collections::BTreeMap::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with(mut self, model: &str, response: MockResponse) -> Self {
+        Arc::get_mut(&mut self.responses)
+            .expect("unique arc")
+            .insert(model.to_string(), response);
+        self
+    }
+}
+
+impl Backend for RoutingMockBackend {
+    fn models(&self) -> Vec<ModelInfo> {
+        self.responses
+            .keys()
+            .map(|k| ModelInfo::new(k.as_str()))
+            .collect()
+    }
+
+    fn complete(&self, request: BackendRequest) -> BackendFuture<'_, Value> {
+        let calls = Arc::clone(&self.calls);
+        let response = self.responses.get(&request.model).cloned();
+        Box::pin(async move {
+            calls.lock().expect("test mutex").push(request.model);
+            match response {
+                Some(MockResponse::CompleteOk(v)) => Ok(v),
+                Some(MockResponse::CompleteErr(e)) => Err(e),
+                _ => Ok(json!({"type":"message","id":"msg_default"})),
+            }
+        })
+    }
+
+    fn stream(&self, request: BackendRequest) -> BackendFuture<'_, BackendStream> {
+        let calls = Arc::clone(&self.calls);
+        let response = self.responses.get(&request.model).cloned();
+        Box::pin(async move {
+            calls.lock().expect("test mutex").push(request.model);
+            match response {
+                Some(MockResponse::StreamOk(events)) => {
+                    Ok(Box::pin(stream::iter(events)) as BackendStream)
+                }
+                Some(MockResponse::StreamErr(e)) => Err(e),
+                _ => Ok(
+                    Box::pin(stream::iter(vec![Ok(json!({"type":"message_stop"}))]))
+                        as BackendStream,
+                ),
+            }
+        })
+    }
+}
+
+fn fallback_map(entries: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+    entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+        .collect()
+}
+
+#[tokio::test]
+async fn fallback_complete_429_primary_then_fallback_serves_request() {
+    let inner = RoutingMockBackend::new()
+        .with(
+            "primary/model",
+            MockResponse::CompleteErr(BackendError::upstream(
+                429u16,
+                "rate_limit_error",
+                "slow down",
+            )),
+        )
+        .with(
+            "backup/model",
+            MockResponse::CompleteOk(json!({"type":"message","id":"msg_backup"})),
+        );
+    let fallbacks = fallback_map(&[("primary/model", &["backup/model"])]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"primary/model","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["id"], "msg_backup");
+}
+
+#[tokio::test]
+async fn fallback_complete_400_primary_passes_through_without_fallback() {
+    let inner = RoutingMockBackend::new()
+        .with(
+            "primary/model",
+            MockResponse::CompleteErr(BackendError::InvalidRequest("bad input".to_string())),
+        )
+        .with(
+            "backup/model",
+            MockResponse::CompleteOk(json!({"type":"message","id":"msg_backup"})),
+        );
+    let fallbacks = fallback_map(&[("primary/model", &["backup/model"])]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"primary/model","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fallback_stream_creation_error_triggers_fallback() {
+    let inner = RoutingMockBackend::new()
+        .with(
+            "primary/model",
+            MockResponse::StreamErr(BackendError::Unavailable("down".to_string())),
+        )
+        .with(
+            "backup/model",
+            MockResponse::StreamOk(vec![Ok(json!({"type":"message_stop"}))]),
+        );
+    let fallbacks = fallback_map(&[("primary/model", &["backup/model"])]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"primary/model","stream":true,"messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+}
+
+#[tokio::test]
+async fn fallback_mid_stream_error_does_not_trigger_fallback() {
+    let inner = RoutingMockBackend::new()
+        .with(
+            "primary/model",
+            MockResponse::StreamOk(vec![
+                Ok(json!({"type":"message_start","message":{"id":"msg_1"}})),
+                Err(BackendError::upstream(
+                    529u16,
+                    "overloaded_error",
+                    "mid-stream failure",
+                )),
+            ]),
+        )
+        .with(
+            "backup/model",
+            MockResponse::StreamOk(vec![Ok(json!({"type":"message_stop"}))]),
+        );
+    let fallbacks = fallback_map(&[("primary/model", &["backup/model"])]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let calls = Arc::clone(&backend.inner().calls);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"primary/model","stream":true,"messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf8 body");
+    // Mid-stream error is encoded as an SSE error event, not replaced.
+    assert!(
+        body.contains("event: error\n"),
+        "mid-stream error must pass through: {body}"
+    );
+    assert!(
+        !body.contains("message_stop"),
+        "fallback stream must not run"
+    );
+    // Only the primary model was called.
+    let calls = calls.lock().expect("test mutex");
+    assert_eq!(calls.as_slice(), &["primary/model"]);
+}
+
+#[tokio::test]
+async fn fallback_two_deep_chain_tries_all_targets() {
+    let inner = RoutingMockBackend::new()
+        .with(
+            "a/model",
+            MockResponse::CompleteErr(BackendError::upstream(503u16, "overloaded_error", "nope")),
+        )
+        .with(
+            "b/model",
+            MockResponse::CompleteErr(BackendError::upstream(502u16, "api_error", "also nope")),
+        )
+        .with(
+            "c/model",
+            MockResponse::CompleteOk(json!({"type":"message","id":"msg_c"})),
+        );
+    let fallbacks = fallback_map(&[("a/model", &["b/model", "c/model"])]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"a/model","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["id"], "msg_c");
+}
+
+#[tokio::test]
+async fn fallback_unmatched_route_returns_original_error() {
+    let inner = RoutingMockBackend::new().with(
+        "lonely/model",
+        MockResponse::CompleteErr(BackendError::upstream(429u16, "rate_limit_error", "slow")),
+    );
+    let fallbacks = fallback_map(&[]);
+    let backend = FallbackBackend::new(inner, fallbacks);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"lonely/model","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+

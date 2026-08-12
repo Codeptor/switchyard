@@ -27,6 +27,10 @@ pub struct SwitchyardConfig {
     /// Alias → `provider/model` route. Single substitution, no chaining.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Route → ordered fallback routes. On eligible errors the gateway
+    /// retries each target in order before returning the last error.
+    #[serde(default)]
+    pub fallbacks: BTreeMap<String, Vec<String>>,
 }
 
 impl SwitchyardConfig {

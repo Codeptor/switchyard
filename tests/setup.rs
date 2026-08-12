@@ -50,7 +50,7 @@ fn write_config_creates_parent_and_refuses_accidental_overwrite() {
     write_config(&path, &config, false).expect("first write");
     assert_eq!(
         fs::read_to_string(&path).expect("config file"),
-        "{\n  \"providers\": [],\n  \"aliases\": {}\n}\n"
+        "{\n  \"providers\": [],\n  \"aliases\": {},\n  \"fallbacks\": {}\n}\n"
     );
 
     let error = write_config(&path, &config, false).expect_err("overwrite must be refused");

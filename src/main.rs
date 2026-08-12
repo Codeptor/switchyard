@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use switchyard::config::{SwitchyardConfig, default_config_path};
-use switchyard::gateway::{Gateway, ListenConfig, ProviderBackend};
+use switchyard::gateway::{FallbackBackend, Gateway, ListenConfig, ProviderBackend};
 use switchyard::setup::{
     ProviderPreset, apply_credentials, build_config, credentials_path, write_config,
     write_credentials,
@@ -224,6 +224,7 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
         )
     })?;
     let aliases = config.aliases.clone();
+    let fallbacks = config.fallbacks.clone();
     let registry = Arc::new(
         config
             .into_registry()
@@ -248,7 +249,9 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(listen.socket_addr()).await?;
-    Gateway::new(ProviderBackend::new(registry, aliases))
+    let backend = ProviderBackend::new(registry, aliases);
+    let backend = FallbackBackend::new(backend, fallbacks);
+    Gateway::new(backend)
         .serve_with_shutdown(listener, shutdown_signal())
         .await
         .context("Switchyard server stopped")
