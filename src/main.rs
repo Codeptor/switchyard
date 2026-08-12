@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use switchyard::config::{SwitchyardConfig, default_config_path};
+use switchyard::doctor;
 use switchyard::gateway::{
     Backend, FallbackBackend, Gateway, HotBackend, ListenConfig, ProviderBackend, Telemetry,
     TelemetryState, UsageSnapshotRow,
@@ -25,7 +26,8 @@ type ConcreteBackend = Telemetry<FallbackBackend<ProviderBackend>>;
 #[derive(Debug, Parser)]
 #[command(
     name = "switchyard",
-    about = "Local provider-agnostic gateway for Claude Code"
+    about = "Local provider-agnostic gateway for Claude Code",
+    long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SWITCHYARD_GIT_SHA"), ")")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,8 +41,30 @@ struct Cli {
 enum Command {
     /// Create a first-run config and optionally store provider credentials.
     Init(InitArgs),
+    /// Run pre-flight checks on config, credentials, reachability, and gateway.
+    Doctor(DoctorArgs),
+    /// List model routes from a running gateway.
+    Models(ModelsArgs),
+    /// Show gateway health and usage summary.
+    Status(StatusArgs),
     /// Query usage statistics from a running gateway.
     Usage(UsageArgs),
+    /// Manage the systemd user service unit.
+    Service(ServiceArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ServiceSubcommand {
+    /// Write a systemd user service unit for switchyard.
+    Install(ServiceInstallArgs),
+    /// Remove the systemd user service unit.
+    Uninstall,
 }
 
 #[derive(Debug, Args)]
@@ -64,7 +88,7 @@ struct RunArgs {
     token: Option<String>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct InitArgs {
     /// Write the generated config to this path.
     #[arg(long, env = "SWITCHYARD_CONFIG")]
@@ -87,7 +111,7 @@ struct InitArgs {
     no_credentials: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct UsageArgs {
     /// Gateway host to connect to.
     #[arg(long, default_value = "127.0.0.1")]
@@ -106,8 +130,38 @@ struct UsageArgs {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Debug, Args)]
+struct DoctorArgs {}
+
+#[derive(Debug, Args)]
+struct ModelsArgs {}
+
+#[derive(Debug, Args)]
+struct StatusArgs {}
+
+#[derive(Debug, Clone, Args)]
+struct ServiceInstallArgs {
+    /// Path to the switchyard config file to bake into the unit.
+    #[arg(long, env = "SWITCHYARD_CONFIG")]
+    config: Option<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Sync subcommands run without a tokio runtime so reqwest::blocking
+    // does not conflict with an outer runtime.
+    match &cli.command {
+        Some(Command::Init(args)) => return run_init(args.clone()),
+        Some(Command::Doctor(_)) => return run_doctor(&cli.run),
+        Some(Command::Models(_)) => return run_models(&cli.run),
+        Some(Command::Status(_)) => return run_status(&cli.run),
+        Some(Command::Usage(args)) => return run_usage(args.clone()),
+        Some(Command::Service(args)) => return run_service(args.command.clone(), &cli.run),
+        None => {}
+    }
+
+    // Gateway command needs the full async runtime.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("switchyard=info")),
@@ -115,12 +169,11 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
-    match cli.command {
-        Some(Command::Init(args)) => run_init(args),
-        Some(Command::Usage(args)) => run_usage(args),
-        None => run_gateway(cli.run).await,
-    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("unable to build tokio runtime")?
+        .block_on(run_gateway(cli.run))
 }
 
 fn run_init(args: InitArgs) -> Result<()> {
@@ -192,9 +245,8 @@ fn run_usage(args: UsageArgs) -> Result<()> {
     }
     let response = match req.send() {
         Ok(resp) => resp,
-        Err(err) if err.is_connect() => {
-            eprintln!("gateway not reachable at {}:{}", args.host, args.port);
-            std::process::exit(1);
+        Err(err) if err.is_connect() || err.is_timeout() => {
+            bail!("gateway not reachable at {}:{}", args.host, args.port);
         }
         Err(err) => return Err(err).context("usage request failed"),
     };
@@ -261,6 +313,246 @@ fn print_usage_table(rows: &[UsageSnapshotRow]) {
         "{:<w_prov$}  {:<w_model$}  {:<w_day$}  {:>8}  {:>12}  {:>13}  {:>6}",
         "TOTAL", "", "", total_requests, total_input, total_output, total_errors
     );
+}
+
+fn run_doctor(run: &RunArgs) -> Result<()> {
+    let config_path = run.config.clone().unwrap_or_else(default_config_path);
+    let cred_path = credentials_path(&config_path);
+    // Load credentials into env so the doctor sees them.
+    let _ = apply_credentials(&cred_path);
+    let ok = doctor::run_doctor(&config_path)?;
+    if !ok {
+        bail!("doctor found issues");
+    }
+    Ok(())
+}
+
+fn run_models(run: &RunArgs) -> Result<()> {
+    let host = run.host.unwrap_or_else(|| ListenConfig::default().host);
+    let port = run.port.unwrap_or_else(|| ListenConfig::default().port);
+    let data = fetch_models(run, host, port)?;
+
+    if data.is_empty() {
+        println!("No models configured.");
+        return Ok(());
+    }
+
+    let mut routes: Vec<(String, String)> = data
+        .iter()
+        .map(|m| {
+            let id = m
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let owned_by = m
+                .get("owned_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            (id, owned_by)
+        })
+        .collect();
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let w_id = routes
+        .iter()
+        .map(|(id, _)| id.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let w_owner = routes
+        .iter()
+        .map(|(_, o)| o.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    println!("{:<w_id$}  {:<w_owner$}", "route", "owned_by");
+    println!("{}", "-".repeat(w_id + w_owner + 2));
+    for (id, owner) in &routes {
+        println!("{:<w_id$}  {:<w_owner$}", id, owner);
+    }
+    Ok(())
+}
+
+fn fetch_models(run: &RunArgs, host: IpAddr, port: u16) -> Result<Vec<serde_json::Value>> {
+    let url = format!("http://{host}:{port}/v1/models");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("unable to build HTTP client")?;
+    let mut req = client.get(&url);
+    if let Some(token) = &run.token {
+        req = req.bearer_auth(token);
+    }
+    let response = match req.send() {
+        Ok(resp) => resp,
+        Err(err) if err.is_connect() || err.is_timeout() => {
+            bail!("gateway not reachable at {host}:{port}");
+        }
+        Err(err) => return Err(err).context("models request failed"),
+    };
+    if !response.status().is_success() {
+        bail!("gateway returned status {}", response.status());
+    }
+    let body: serde_json::Value = response.json().context("unable to parse models response")?;
+    let data = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .context("models response missing 'data' array")?
+        .clone();
+    Ok(data)
+}
+
+fn run_status(run: &RunArgs) -> Result<()> {
+    let host = run.host.unwrap_or_else(|| ListenConfig::default().host);
+    let port = run.port.unwrap_or_else(|| ListenConfig::default().port);
+
+    let (health, usage_rows) = fetch_status(run, host, port)?;
+
+    println!("\x1b[1mswitchyard status\x1b[0m");
+    println!();
+    println!("  gateway   http://{host}:{port}  \x1b[32mhealthy\x1b[0m");
+    if let Some(version) = health.get("version").and_then(|v| v.as_str()) {
+        println!("  version   {version}");
+    }
+    if let Some(sha) = health.get("git_sha").and_then(|v| v.as_str()) {
+        println!("  git_sha   {sha}");
+    }
+
+    if let Some(rows) = usage_rows
+        && !rows.is_empty()
+    {
+        println!();
+        print_usage_table(&rows);
+    }
+
+    Ok(())
+}
+
+fn fetch_status(
+    run: &RunArgs,
+    host: IpAddr,
+    port: u16,
+) -> Result<(serde_json::Value, Option<Vec<UsageSnapshotRow>>)> {
+    let base = format!("http://{host}:{port}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("unable to build HTTP client")?;
+
+    // Health
+    let mut req = client.get(format!("{base}/health"));
+    if let Some(token) = &run.token {
+        req = req.bearer_auth(token);
+    }
+    let health_resp = match req.send() {
+        Ok(resp) => resp,
+        Err(err) if err.is_connect() || err.is_timeout() => {
+            bail!("gateway not reachable at {host}:{port}");
+        }
+        Err(err) => return Err(err).context("health request failed"),
+    };
+    if !health_resp.status().is_success() {
+        bail!("gateway returned status {}", health_resp.status());
+    }
+    let health: serde_json::Value = health_resp
+        .json()
+        .context("unable to parse health response")?;
+
+    // Usage (best-effort)
+    let mut req = client.get(format!("{base}/usage"));
+    if let Some(token) = &run.token {
+        req = req.bearer_auth(token);
+    }
+    let usage_rows = if let Ok(resp) = req.send()
+        && resp.status().is_success()
+        && let Ok(rows) = resp.json::<Vec<UsageSnapshotRow>>()
+    {
+        Some(rows)
+    } else {
+        None
+    };
+
+    Ok((health, usage_rows))
+}
+
+fn run_service(sub: ServiceSubcommand, run_args: &RunArgs) -> Result<()> {
+    match sub {
+        ServiceSubcommand::Install(args) => install_service(args, run_args),
+        ServiceSubcommand::Uninstall => uninstall_service(),
+    }
+}
+
+fn install_service(args: ServiceInstallArgs, run_args: &RunArgs) -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set; cannot determine user config dir")?;
+    let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+    let unit_path = unit_dir.join("switchyard.service");
+
+    let config_path = args
+        .config
+        .or_else(|| run_args.config.clone())
+        .unwrap_or_else(default_config_path);
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        std::env::current_dir()
+            .context("unable to resolve current directory")?
+            .join(config_path)
+    };
+
+    let exe = std::env::current_exe().context("unable to determine switchyard binary path")?;
+    let unit_content = render_systemd_unit(&exe, &config_path);
+
+    std::fs::create_dir_all(&unit_dir)
+        .with_context(|| format!("unable to create {}", unit_dir.display()))?;
+    std::fs::write(&unit_path, unit_content)
+        .with_context(|| format!("unable to write {}", unit_path.display()))?;
+
+    println!("Installed {}", unit_path.display());
+    println!();
+    println!("To activate:");
+    println!("  systemctl --user daemon-reload");
+    println!("  systemctl --user enable --now switchyard");
+    Ok(())
+}
+
+fn uninstall_service() -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set; cannot determine user config dir")?;
+    let unit_path = PathBuf::from(&home)
+        .join(".config/systemd/user")
+        .join("switchyard.service");
+
+    if unit_path.exists() {
+        std::fs::remove_file(&unit_path)
+            .with_context(|| format!("unable to remove {}", unit_path.display()))?;
+        println!("Removed {}", unit_path.display());
+        println!();
+        println!("Run: systemctl --user daemon-reload");
+    } else {
+        println!("No service unit found at {}", unit_path.display());
+    }
+    Ok(())
+}
+
+fn render_systemd_unit(exe: &Path, config: &Path) -> String {
+    format!(
+        "\
+[Unit]
+Description=Switchyard — local Anthropic gateway for Claude Code
+After=network-online.target
+
+[Service]
+ExecStart=\"{exe}\" --config {config}
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+",
+        exe = exe.display(),
+        config = config.display(),
+    )
 }
 
 fn selected_presets(args: &InitArgs) -> Result<Vec<ProviderPreset>> {

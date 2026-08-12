@@ -84,12 +84,15 @@ async fn health_and_models_are_exposed_without_upstream_calls() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(response.into_body(), usize::MAX)
+    let health_body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body"),
-        r#"{"status":"ok"}"#
-    );
+    )
+    .expect("health json");
+    assert_eq!(health_body["status"], "ok");
+    assert!(health_body["version"].is_string());
+    assert!(health_body["git_sha"].is_string());
 
     let response = app
         .clone()
