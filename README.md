@@ -17,6 +17,33 @@ cargo run -- --config ~/.config/switchyard/config.json
 
 The default listener is `127.0.0.1:3456`, which keeps the gateway local inside WSL. Claude Code model selections use `provider/model`, for example `kimi/kimi-k3[1m]`, `muse/muse-spark-1.2-contributor`, or `qwen/qwen3.8-max`. The gateway exposes `/v1/models` so a client can discover manually configured models without an upstream model-list request.
 
+Point Claude Code at Switchyard once per shell (or put these exports in your WSL shell profile):
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
+export ANTHROPIC_AUTH_TOKEN=switchyard-local
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+Then start Claude Code with a model or switch inside the TUI without editing Claude Code settings:
+
+```bash
+claude --model 'kimi/kimi-k3[1m]'
+```
+
+```text
+/model qwen/qwen3.8-max
+/model muse/muse-spark-1.2-contributor
+```
+
+For Qwen's 1M-context plan, use the `[1m]` model ID when that model supports it and follow [QwenCloud's Claude Code guide](https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code) for the matching context setting.
+
+For the Qwen Token Plan example in that guide, the matching WSL export is:
+
+```bash
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616
+```
+
 ## Worktrees
 
 - `switchyard` — integration baseline

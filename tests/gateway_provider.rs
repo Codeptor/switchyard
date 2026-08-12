@@ -130,6 +130,31 @@ async fn provider_backend_resolves_provider_model_and_rewrites_upstream_model() 
 }
 
 #[tokio::test]
+async fn provider_backend_strips_context_suffix_before_upstream_forwarding() {
+    let adapter = StubAdapter::new("alpha");
+    let requests = Arc::clone(&adapter.requests);
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register_adapter(
+            Arc::new(adapter),
+            vec!["model-one[1m]".to_string()],
+            Some("model-one[1m]".to_string()),
+        )
+        .expect("register adapter");
+
+    let app = Gateway::new(ProviderBackend::new(Arc::new(registry))).router();
+    let body = json!({
+        "model": "alpha/model-one",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}]
+    });
+
+    let response = app.oneshot(json_request(&body)).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests.lock().expect("test mutex")[0].model, "model-one");
+}
+
+#[tokio::test]
 async fn provider_backend_forwards_normalized_stream_events() {
     let adapter = StubAdapter::new("alpha");
     let mut registry = ProviderRegistry::new();

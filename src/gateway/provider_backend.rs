@@ -49,7 +49,7 @@ impl Backend for ProviderBackend {
                 .registry
                 .resolve(provider_id, Some(model_id))
                 .map_err(map_provider_error)?;
-            let typed_request = parse_request(request.body, model_id)?;
+            let typed_request = parse_request(request.body, &handle.model_id)?;
             let response = handle
                 .adapter
                 .complete(typed_request)
@@ -68,7 +68,7 @@ impl Backend for ProviderBackend {
                 .registry
                 .resolve(provider_id, Some(model_id))
                 .map_err(map_provider_error)?;
-            let typed_request = parse_request(request.body, model_id)?;
+            let typed_request = parse_request(request.body, &handle.model_id)?;
             let provider_stream = handle
                 .adapter
                 .stream(typed_request)

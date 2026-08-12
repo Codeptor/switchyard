@@ -117,27 +117,32 @@ impl ProviderRegistry {
             .get(provider_id)
             .ok_or_else(|| ProviderError::ProviderNotFound(provider_id.to_string()))?;
 
-        let effective_model = match model_id {
-            Some(m) => m.to_string(),
+        let requested_model = match model_id {
+            Some(m) => m,
             None => self
                 .default_models
                 .get(provider_id)
-                .cloned()
+                .map(String::as_str)
                 .ok_or_else(|| ProviderError::ModelNotFound {
                     provider: provider_id.to_string(),
                     model: "(no model specified and no default)".to_string(),
                 })?,
         };
 
+        let effective_model = model_without_context_suffix(requested_model).to_string();
+
         // Validate that the model is known if the provider has a non-empty model list.
         // If the list is empty, any model id is accepted (manual configuration without discovery).
         if let Some(known) = self.models.get(provider_id)
             && !known.is_empty()
-            && !known.contains(&effective_model)
+            && !known.iter().any(|configured| {
+                configured == requested_model
+                    || model_without_context_suffix(configured) == effective_model
+            })
         {
             return Err(ProviderError::ModelNotFound {
                 provider: provider_id.to_string(),
-                model: effective_model,
+                model: requested_model.to_string(),
             });
         }
 
@@ -162,6 +167,17 @@ impl ProviderRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.adapters.is_empty()
+    }
+}
+
+/// Claude Code uses a trailing `[1m]` suffix to select a larger context
+/// window, then removes it before sending the provider request. Treat it as
+/// routing metadata so either form resolves to the same upstream model.
+fn model_without_context_suffix(model: &str) -> &str {
+    if model.len() >= 4 && model[model.len() - 4..].eq_ignore_ascii_case("[1m]") {
+        &model[..model.len() - 4]
+    } else {
+        model
     }
 }
 
@@ -241,5 +257,20 @@ mod tests {
         reg.register_anthropic(c).expect("register");
         let h = reg.resolve("prov-c", None).expect("default");
         assert_eq!(h.model_id, "m1");
+    }
+
+    #[test]
+    fn one_million_context_suffix_resolves_as_an_alias() {
+        let mut reg = ProviderRegistry::new();
+        reg.register_anthropic(cfg("prov-d", vec!["model[1m]"]))
+            .expect("register");
+
+        let base = reg.resolve("prov-d", Some("model")).expect("base alias");
+        assert_eq!(base.model_id, "model");
+
+        let suffixed = reg
+            .resolve("prov-d", Some("model[1m]"))
+            .expect("suffixed model");
+        assert_eq!(suffixed.model_id, "model");
     }
 }
