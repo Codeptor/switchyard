@@ -1054,3 +1054,307 @@ async fn auth_no_token_configured_passes_all_requests() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(calls.lock().expect("test mutex").len(), 1);
 }
+
+// ── F8: usage accounting ──────────────────────────────────────────────
+
+use switchyard::gateway::{HotBackend, Telemetry, TelemetryState};
+
+#[tokio::test]
+async fn usage_endpoint_reflects_completed_requests() {
+    let state = TelemetryState::new();
+    let backend = MockBackend::default();
+    let telemetry = Telemetry::new(backend, Arc::clone(&state));
+    let app = Gateway::new(telemetry)
+        .with_telemetry(Arc::clone(&state))
+        .router();
+
+    // Make a request
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Check /usage
+    let response = app
+        .clone()
+        .oneshot(Request::get("/usage").body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("usage json");
+    assert!(body.is_array());
+    let rows = body.as_array().expect("array");
+    assert!(!rows.is_empty(), "should have at least one usage row");
+    let row = &rows[0];
+    assert_eq!(row["provider"], "kimi");
+    assert_eq!(row["model"], "kimi-k3[1m]");
+    assert!(row["requests"].as_u64().expect("requests") >= 1);
+}
+
+#[tokio::test]
+async fn usage_captures_stream_usage_from_message_start_and_delta() {
+    let state = TelemetryState::new();
+    let backend = MockBackend::with_events(vec![
+        Ok(
+            json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"qwen3.8-max","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":42,"output_tokens":0}}}),
+        ),
+        Ok(
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+        ),
+        Ok(
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":17}}),
+        ),
+        Ok(json!({"type":"message_stop"})),
+    ]);
+    let telemetry = Telemetry::new(backend, Arc::clone(&state));
+    let app = Gateway::new(telemetry)
+        .with_telemetry(Arc::clone(&state))
+        .router();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"qwen/qwen3.8-max","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    // Drain the stream to trigger completion
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+
+    let rows = state.usage_snapshot();
+    let row = rows
+        .iter()
+        .find(|r| r.provider == "qwen" && r.model == "qwen3.8-max");
+    let row = row.expect("should have qwen row");
+    assert_eq!(row.input_tokens, 42);
+    assert_eq!(row.output_tokens, 17);
+    assert_eq!(row.requests, 1);
+    assert_eq!(row.errors, 0);
+}
+
+#[tokio::test]
+async fn usage_counts_errors() {
+    let state = TelemetryState::new();
+    let backend = MockBackend::with_completion(Err(BackendError::upstream(
+        529u16,
+        "overloaded_error",
+        "provider overloaded",
+    )));
+    let telemetry = Telemetry::new(backend, Arc::clone(&state));
+    let app = Gateway::new(telemetry)
+        .with_telemetry(Arc::clone(&state))
+        .router();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::from_u16(529).expect("status")
+    );
+
+    let rows = state.usage_snapshot();
+    let row = rows.iter().find(|r| r.provider == "kimi");
+    let row = row.expect("should have kimi row");
+    assert_eq!(row.requests, 1);
+    assert_eq!(row.errors, 1);
+}
+
+// ── F9: /metrics (Prometheus) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_endpoint_contains_expected_lines() {
+    let state = TelemetryState::new();
+    let backend = MockBackend::default();
+    let telemetry = Telemetry::new(backend, Arc::clone(&state));
+    let app = Gateway::new(telemetry)
+        .with_telemetry(Arc::clone(&state))
+        .router();
+
+    // Make a request to generate metrics
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Check /metrics
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf8 body");
+    assert!(
+        body.contains(
+            "switchyard_requests_total{provider=\"kimi\",model=\"kimi-k3[1m]\",class=\"ok\"} 1"
+        ),
+        "expected ok counter: {body}"
+    );
+    assert!(
+        body.contains(
+            "switchyard_request_duration_seconds_count{provider=\"kimi\",model=\"kimi-k3[1m]\"} 1"
+        ),
+        "expected histogram count: {body}"
+    );
+    assert!(
+        body.contains("switchyard_request_duration_seconds_bucket{provider=\"kimi\",model=\"kimi-k3[1m]\",le=\"+Inf\"} 1"),
+        "expected +Inf bucket: {body}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_stream_records_time_to_first_event() {
+    let state = TelemetryState::new();
+    let backend = MockBackend::with_events(vec![
+        Ok(
+            json!({"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}),
+        ),
+        Ok(json!({"type":"message_stop"})),
+    ]);
+    let telemetry = Telemetry::new(backend, Arc::clone(&state));
+    let app = Gateway::new(telemetry)
+        .with_telemetry(Arc::clone(&state))
+        .router();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","stream":true,"messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+
+    let text = state.metrics_text();
+    assert!(
+        text.contains(
+            "switchyard_request_duration_seconds_count{provider=\"kimi\",model=\"kimi-k3[1m]\"} 1"
+        ),
+        "expected histogram from stream: {text}"
+    );
+}
+
+// ── F6: SIGHUP hot reload ──────────────────────────────────────────────
+
+#[derive(Clone)]
+struct ReloadableMockBackend {
+    models: Arc<Mutex<Vec<ModelInfo>>>,
+}
+
+impl ReloadableMockBackend {
+    fn new(models: Vec<&str>) -> Self {
+        Self {
+            models: Arc::new(Mutex::new(models.into_iter().map(ModelInfo::new).collect())),
+        }
+    }
+}
+
+impl Backend for ReloadableMockBackend {
+    fn models(&self) -> Vec<ModelInfo> {
+        self.models.lock().expect("test mutex").clone()
+    }
+
+    fn complete(&self, _request: BackendRequest) -> BackendFuture<'_, Value> {
+        Box::pin(async { Ok(json!({"type":"message","id":"msg_reload"})) })
+    }
+
+    fn stream(&self, _request: BackendRequest) -> BackendFuture<'_, BackendStream> {
+        Box::pin(async {
+            Ok(Box::pin(stream::iter(vec![Ok(json!({"type":"message_stop"}))])) as BackendStream)
+        })
+    }
+}
+
+#[tokio::test]
+async fn hot_swap_backend_reflects_new_models() {
+    let backend1 = ReloadableMockBackend::new(vec!["old/model-a"]);
+    let hot = HotBackend::new(backend1);
+    let app = Gateway::new(hot.clone()).router();
+
+    // Check initial models
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("models json");
+    assert_eq!(body["data"][0]["id"], "old/model-a");
+
+    // Swap to new backend with different models
+    let backend2 = ReloadableMockBackend::new(vec!["new/model-x", "new/model-y"]);
+    hot.swap(backend2);
+
+    // Check models after swap — on the SAME router
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("models json");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|m| m["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["new/model-x", "new/model-y"]);
+}

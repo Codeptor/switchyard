@@ -20,10 +20,12 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use super::backend::{Backend, BackendError, BackendRequest, BackendStream, ModelInfo};
+use super::telemetry::TelemetryState;
 
 struct AppState<B> {
     backend: Arc<B>,
     token: Option<Arc<String>>,
+    telemetry: Option<Arc<TelemetryState>>,
 }
 
 impl<B> Clone for AppState<B> {
@@ -31,6 +33,7 @@ impl<B> Clone for AppState<B> {
         Self {
             backend: Arc::clone(&self.backend),
             token: self.token.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -39,6 +42,7 @@ impl<B> Clone for AppState<B> {
 pub struct Gateway<B> {
     backend: Arc<B>,
     token: Option<Arc<String>>,
+    telemetry: Option<Arc<TelemetryState>>,
 }
 
 impl<B> Clone for Gateway<B> {
@@ -46,6 +50,7 @@ impl<B> Clone for Gateway<B> {
         Self {
             backend: Arc::clone(&self.backend),
             token: self.token.clone(),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -55,6 +60,7 @@ impl<B: Backend> Gateway<B> {
         Self {
             backend: Arc::new(backend),
             token: None,
+            telemetry: None,
         }
     }
 
@@ -64,15 +70,28 @@ impl<B: Backend> Gateway<B> {
         self
     }
 
+    /// Attach telemetry state, enabling `/usage` and `/metrics` routes.
+    pub fn with_telemetry(mut self, state: Arc<TelemetryState>) -> Self {
+        self.telemetry = Some(state);
+        self
+    }
+
     pub fn router(self) -> Router {
         let state = AppState {
             backend: self.backend,
             token: self.token,
+            telemetry: self.telemetry,
         };
-        Router::new()
+        let mut router = Router::new()
             .route("/health", get(health))
             .route("/v1/models", get(models::<B>))
-            .route("/v1/messages", post(messages::<B>))
+            .route("/v1/messages", post(messages::<B>));
+        if state.telemetry.is_some() {
+            router = router
+                .route("/usage", get(usage::<B>))
+                .route("/metrics", get(metrics::<B>));
+        }
+        router
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 bearer_auth_middleware::<B>,
@@ -410,6 +429,27 @@ fn encode_event(event: Value) -> Bytes {
         Err(_) => r#"{"type":"error","error":{"type":"api_error","message":"failed to encode stream event"}}"#.to_string(),
     };
     Bytes::from(format!("event: {event_name}\ndata: {data}\n\n"))
+}
+
+async fn usage<B: Backend>(State(state): State<AppState<B>>) -> impl IntoResponse {
+    let Some(telemetry) = &state.telemetry else {
+        return (StatusCode::NOT_FOUND, "telemetry not enabled").into_response();
+    };
+    axum::Json(telemetry.usage_snapshot()).into_response()
+}
+
+async fn metrics<B: Backend>(State(state): State<AppState<B>>) -> impl IntoResponse {
+    let Some(telemetry) = &state.telemetry else {
+        return (StatusCode::NOT_FOUND, "telemetry not enabled").into_response();
+    };
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        telemetry.metrics_text(),
+    )
+        .into_response()
 }
 
 fn error_response(error: &BackendError, request_id: &str) -> Response {
