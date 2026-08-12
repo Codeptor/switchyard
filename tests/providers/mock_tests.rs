@@ -10,11 +10,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{
+    Router,
     body::Body,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Router,
 };
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
@@ -121,7 +121,9 @@ fn malformed_provider_id_rejected() {
 fn malformed_base_url_rejected() {
     let cfg = ProviderConfig {
         id: "prov-1".to_string(),
-        base_url: "ftp://example.test".parse().expect("url parses but invalid scheme"),
+        base_url: "ftp://example.test"
+            .parse()
+            .expect("url parses but invalid scheme"),
         auth: AuthConfig::None,
         models: vec![],
         timeout_ms: None,
@@ -174,7 +176,9 @@ fn registry_rejects_duplicate_provider() {
     };
     let cfg2 = cfg1.clone();
     reg.register_anthropic(cfg1).expect("first");
-    let err = reg.register_anthropic(cfg2).expect_err("duplicate should fail");
+    let err = reg
+        .register_anthropic(cfg2)
+        .expect_err("duplicate should fail");
     assert!(err.to_string().contains("duplicate"));
 }
 
@@ -469,12 +473,14 @@ async fn streaming_tool_use_and_usage_normalized() {
     let parsed: serde_json::Value = serde_json::from_str(&combined).expect("tool input valid json");
     assert_eq!(parsed["query"], "hi");
 
-    let has_tool_stop = events.iter().any(|e| match e {
-        switchyard::providers::StreamEvent::MessageDelta {
-            stop_reason: Some(StopReason::ToolUse),
-            ..
-        } => true,
-        _ => false,
+    let has_tool_stop = events.iter().any(|e| {
+        matches!(
+            e,
+            switchyard::providers::StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            }
+        )
     });
     assert!(has_tool_stop, "expected ToolUse stop reason");
 
@@ -487,9 +493,11 @@ async fn streaming_tool_use_and_usage_normalized() {
     });
     assert!(usage_ok);
 
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, switchyard::providers::StreamEvent::MessageStop)));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, switchyard::providers::StreamEvent::MessageStop))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -533,10 +541,11 @@ async fn complete_with_tool_use_normalized() {
     assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
     assert_eq!(resp.usage.input_tokens, 5);
     assert_eq!(resp.usage.output_tokens, 10);
-    assert!(resp
-        .content
-        .iter()
-        .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "lookup")));
+    assert!(
+        resp.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "lookup"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -591,8 +600,14 @@ fn redact_headers_removes_secrets() {
     headers.insert("x-api-key".to_string(), "sk-xyz".to_string());
     headers.insert("content-type".to_string(), "application/json".to_string());
     let redacted = switchyard::providers::credentials::redact_headers(&headers);
-    assert_eq!(redacted.get("Authorization").map(|s| s.as_str()), Some("[REDACTED]"));
-    assert_eq!(redacted.get("x-api-key").map(|s| s.as_str()), Some("[REDACTED]"));
+    assert_eq!(
+        redacted.get("Authorization").map(|s| s.as_str()),
+        Some("[REDACTED]")
+    );
+    assert_eq!(
+        redacted.get("x-api-key").map(|s| s.as_str()),
+        Some("[REDACTED]")
+    );
     assert_eq!(
         redacted.get("content-type").map(|s| s.as_str()),
         Some("application/json")
