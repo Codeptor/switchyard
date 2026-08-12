@@ -13,7 +13,7 @@ use switchyard::setup::{
     write_credentials,
 };
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,12 @@ struct RunArgs {
     /// Local bind port.
     #[arg(long, env = "SWITCHYARD_PORT", global = true)]
     port: Option<u16>,
+
+    /// Optional bearer token for API authentication. When set, /v1/* routes
+    /// require Authorization: Bearer <token>. Non-loopback binds are only
+    /// permitted when a token is configured.
+    #[arg(long, env = "SWITCHYARD_TOKEN", global = true)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -231,27 +237,41 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
             .context("unable to initialize configured providers")?,
     );
     let defaults = ListenConfig::default();
+    let authenticated = args.token.is_some();
     let listen = ListenConfig::new(
         args.host.unwrap_or(defaults.host),
         args.port.unwrap_or(defaults.port),
     );
     listen
-        .validate()
+        .validate(authenticated)
         .map_err(anyhow::Error::msg)
         .context("refusing to expose provider credentials on a non-loopback listener")?;
+
+    if !listen.host.is_loopback() {
+        warn!(
+            address = %listen.socket_addr(),
+            authenticated = authenticated,
+            "binding to non-loopback address — ensure network-level access controls are in place"
+        );
+    }
 
     info!(
         config = %config_path.display(),
         providers = registry.len(),
         credentials_loaded = credential_count,
         address = %listen.socket_addr(),
+        authenticated = authenticated,
         "starting switchyard"
     );
 
     let listener = tokio::net::TcpListener::bind(listen.socket_addr()).await?;
     let backend = ProviderBackend::new(registry, aliases);
     let backend = FallbackBackend::new(backend, fallbacks);
-    Gateway::new(backend)
+    let mut gateway = Gateway::new(backend);
+    if let Some(token) = args.token {
+        gateway = gateway.with_token(token);
+    }
+    gateway
         .serve_with_shutdown(listener, shutdown_signal())
         .await
         .context("Switchyard server stopped")

@@ -27,10 +27,10 @@ impl ListenConfig {
         SocketAddr::new(self.host, self.port)
     }
 
-    /// The gateway carries upstream credentials and has no remote auth layer;
-    /// keep the listener local until one is deliberately added.
-    pub fn validate(self) -> Result<(), &'static str> {
-        if self.host.is_loopback() {
+    /// The gateway carries upstream credentials. Non-loopback binds are only
+    /// permitted when a bearer token guards the API routes.
+    pub fn validate(self, authenticated: bool) -> Result<(), &'static str> {
+        if self.host.is_loopback() || authenticated {
             Ok(())
         } else {
             Err("non-loopback listeners require an authenticated gateway")
@@ -51,8 +51,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_loopback_listeners_without_authentication() {
+    fn loopback_without_token_is_allowed() {
+        let listen = ListenConfig::default();
+        assert!(listen.validate(false).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_without_token_is_refused() {
         let listen = ListenConfig::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3456);
-        assert!(listen.validate().is_err());
+        assert!(listen.validate(false).is_err());
+    }
+
+    #[test]
+    fn non_loopback_with_token_is_allowed() {
+        let listen = ListenConfig::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3456);
+        assert!(listen.validate(true).is_ok());
     }
 }

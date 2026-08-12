@@ -23,12 +23,14 @@ use super::backend::{Backend, BackendError, BackendRequest, BackendStream, Model
 
 struct AppState<B> {
     backend: Arc<B>,
+    token: Option<Arc<String>>,
 }
 
 impl<B> Clone for AppState<B> {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
+            token: self.token.clone(),
         }
     }
 }
@@ -36,12 +38,14 @@ impl<B> Clone for AppState<B> {
 /// Claude Code-facing gateway.
 pub struct Gateway<B> {
     backend: Arc<B>,
+    token: Option<Arc<String>>,
 }
 
 impl<B> Clone for Gateway<B> {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
+            token: self.token.clone(),
         }
     }
 }
@@ -50,19 +54,32 @@ impl<B: Backend> Gateway<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend: Arc::new(backend),
+            token: None,
         }
     }
 
+    /// Require `Authorization: Bearer <token>` on `/v1/*` routes.
+    pub fn with_token(mut self, token: String) -> Self {
+        self.token = Some(Arc::new(token));
+        self
+    }
+
     pub fn router(self) -> Router {
+        let state = AppState {
+            backend: self.backend,
+            token: self.token,
+        };
         Router::new()
             .route("/health", get(health))
             .route("/v1/models", get(models::<B>))
             .route("/v1/messages", post(messages::<B>))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware::<B>,
+            ))
             .layer(middleware::from_fn(request_id_middleware))
             .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-            .with_state(AppState {
-                backend: self.backend,
-            })
+            .with_state(state)
     }
 
     /// Serve the gateway with a caller-supplied shutdown signal.
@@ -134,6 +151,60 @@ async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Respon
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
+    response
+}
+
+async fn bearer_auth_middleware<B: Backend>(
+    State(state): State<AppState<B>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = &state.token else {
+        return next.run(request).await;
+    };
+    let path = request.uri().path();
+    if !path.starts_with("/v1/") {
+        return next.run(request).await;
+    }
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+            next.run(request).await
+        }
+        _ => auth_error_response(),
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+fn auth_error_response() -> Response {
+    let error = BackendError::upstream(
+        401u16,
+        "authentication_error",
+        "missing or invalid bearer token",
+    );
+    let body = ErrorResponse {
+        kind: "error",
+        request_id: String::new(),
+        error: ErrorDetail {
+            kind: "authentication_error".to_string(),
+            message: error.public_message(),
+        },
+    };
+    let mut response = axum::Json(body).into_response();
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
     response
 }
 

@@ -941,3 +941,116 @@ async fn fallback_unmatched_route_returns_original_error() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
+// ── F15: bearer token authentication ──────────────────────────────────
+
+#[tokio::test]
+async fn auth_missing_token_returns_401() {
+    let app = Gateway::new(MockBackend::default())
+        .with_token("secret-token".to_string())
+        .router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body"),
+    )
+    .expect("json");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "authentication_error");
+}
+
+#[tokio::test]
+async fn auth_wrong_token_returns_401() {
+    let app = Gateway::new(MockBackend::default())
+        .with_token("secret-token".to_string())
+        .router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong-token")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "kimi/kimi-k3[1m]",
+                        "messages": [{"role":"user","content":"hi"}]
+                    }))
+                    .expect("json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_correct_token_reaches_backend() {
+    let app = Gateway::new(MockBackend::default())
+        .with_token("secret-token".to_string())
+        .router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "kimi/kimi-k3[1m]",
+                        "messages": [{"role":"user","content":"hi"}]
+                    }))
+                    .expect("json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_health_endpoint_open_without_token() {
+    let app = Gateway::new(MockBackend::default())
+        .with_token("secret-token".to_string())
+        .router();
+
+    let response = app
+        .oneshot(
+            Request::get("/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_no_token_configured_passes_all_requests() {
+    let backend = MockBackend::default();
+    let calls = Arc::clone(&backend.calls);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(json_request(
+            "/v1/messages",
+            &json!({"model":"kimi/kimi-k3[1m]","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.lock().expect("test mutex").len(), 1);
+}
