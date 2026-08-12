@@ -122,6 +122,31 @@ switchyard service uninstall
 
 Prints the version and embedded git short SHA: `0.1.0 (abc1234)`.
 
+## Model aliases
+
+Map short names to `provider/model` routes in the root config:
+
+```json
+{
+  "providers": [ ... ],
+  "aliases": {
+    "fast": "qwen/qwen3.6-flash"
+  }
+}
+```
+
+Aliases resolve before routing, appear in `/v1/models`, and work anywhere a
+route does (`claude --model fast`, `/model fast`, `ANTHROPIC_MODEL=fast`).
+Substitution is single-step: an alias target is not re-resolved as an alias.
+
+Note on Claude Code model discovery: with
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`, Claude Code only shows
+gateway models whose id contains `claude` or `anthropic` in its `/model`
+picker. To surface a provider model there, add an alias with a matching
+name, e.g. `"claude-k3": "kimi/kimi-k3[1m]"`. Env-var model selection
+(`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`) is unaffected by this
+filter.
+
 ## Fallback routing
 
 Configure ordered fallback routes for transient upstream failures. When a

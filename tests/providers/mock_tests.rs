@@ -1248,7 +1248,7 @@ async fn extra_headers_override_same_name_forwarded_header() {
     })
     .await;
 
-    let mut cfg = ProviderConfig {
+    let cfg = ProviderConfig {
         id: "prov-override".to_string(),
         base_url: server.base_url().parse().expect("url"),
         auth: AuthConfig::None,

@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn forward_headers_not_serialized_into_body() {
-        let mut req = MessagesRequest {
+        let req = MessagesRequest {
             model: "m1".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),

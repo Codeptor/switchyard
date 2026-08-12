@@ -48,5 +48,11 @@
         { "id": "qwen3.6-flash" }
       ]
     }
-  ]
+  ],
+  "aliases": {
+    "fast": "qwen/qwen3.6-flash"
+  },
+  "fallbacks": {
+    "kimi/kimi-k3[1m]": ["qwen/qwen3.8-max"]
+  }
 }
