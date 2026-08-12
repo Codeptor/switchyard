@@ -12,6 +12,7 @@ use switchyard::setup::{
     ProviderPreset, apply_credentials, build_config, credentials_path, write_config,
     write_credentials,
 };
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -245,8 +246,29 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
         "starting switchyard"
     );
 
+    let listener = tokio::net::TcpListener::bind(listen.socket_addr()).await?;
     Gateway::new(ProviderBackend::new(registry))
-        .bind_and_serve(listen.socket_addr())
+        .serve_with_shutdown(listener, shutdown_signal())
         .await
         .context("Switchyard server stopped")
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl-c handler");
+    };
+
+    let terminate = async {
+        signal(SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
 }
