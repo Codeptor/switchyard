@@ -206,13 +206,14 @@ async fn bearer_auth_middleware<B: Backend>(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let max_len = a.len().max(b.len());
+    let mut result: u8 = (a.len() as u8) ^ (b.len() as u8);
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        result |= x ^ y;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    result == 0
 }
 
 fn auth_error_response(request_id: &str) -> Response {
