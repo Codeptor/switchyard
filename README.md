@@ -65,7 +65,7 @@ Kimi extensions. Qwen documents both `Authorization: Bearer ...` and
 Useful upstream references:
 
 - [QwenCloud Claude Code integration](https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code)
-- [Moonshot Kimi API](https://platform.kimi.ai/docs/api/chat)
+- [Kimi Claude Code integration](https://platform.kimi.ai/docs/guide/claude-code-kimi)
 - [Meta Muse Spark API announcement](https://ai.meta.com/blog/introducing-muse-spark-meta-model-api/)
 
 ## Worktrees
