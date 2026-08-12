@@ -4,7 +4,29 @@ Switchyard is a local, provider-agnostic gateway for Claude Code. Claude Code ta
 
 ## Local development
 
-Copy `config.example.json` to `~/.config/switchyard/config.json`, set the credential environment variables named by each provider, and start the gateway:
+Install/build the binary, then use the first-run CLI. It asks which built-in
+providers to enable and reads API keys with hidden input:
+
+```bash
+cargo install --path .
+switchyard init
+switchyard
+```
+
+`init` writes `~/.config/switchyard/config.json` and, when keys are entered,
+stores them separately in `~/.config/switchyard/credentials.json` with `0600`
+permissions. Existing environment variables take precedence, and keys are
+never written into the provider config or printed. Use `--force` to replace an
+existing setup. For a config template without key prompts:
+
+```bash
+switchyard init --all --no-credentials
+```
+
+Choose presets non-interactively with `--provider kimi`, `--provider muse`, or
+`--provider qwen`; repeat the flag or use a comma-separated list.
+
+Manual setup remains supported:
 
 ```bash
 mkdir -p ~/.config/switchyard

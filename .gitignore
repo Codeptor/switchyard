@@ -4,6 +4,7 @@
 *.key
 *.pem
 *.secret
+credentials.json
 logs/
 tmp/
 dist/
