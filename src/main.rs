@@ -13,8 +13,8 @@ use switchyard::gateway::{
     TelemetryState, UsageSnapshotRow,
 };
 use switchyard::setup::{
-    ProviderPreset, apply_credentials, build_config, credentials_path, load_credential_names,
-    reload_credentials, write_config, write_credentials,
+    ProviderPreset, apply_credentials, build_config, credentials_path, reload_credentials,
+    write_config, write_credentials,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -642,10 +642,9 @@ fn build_backend(
 async fn run_gateway(args: RunArgs) -> Result<()> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let cred_path = credentials_path(&config_path);
-    let credential_count =
+    let applied_cred_names =
         apply_credentials(&cred_path).context("unable to load local credentials")?;
-    let tracked_creds =
-        load_credential_names(&cred_path).context("unable to read credential names")?;
+    let credential_count = applied_cred_names.len();
     let config = SwitchyardConfig::load(&config_path).with_context(|| {
         format!(
             "unable to load Switchyard configuration from {}",
@@ -693,7 +692,13 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
     gateway
         .serve_with_shutdown(
             listener,
-            reload_or_shutdown(hot, config_path, cred_path, tracked_creds, telemetry_state),
+            reload_or_shutdown(
+                hot,
+                config_path,
+                cred_path,
+                applied_cred_names,
+                telemetry_state,
+            ),
         )
         .await
         .context("Switchyard server stopped")

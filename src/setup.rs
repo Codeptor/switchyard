@@ -189,12 +189,14 @@ pub fn write_credentials(
 }
 
 /// Load stored credentials into the current process without replacing values
-/// already supplied by the caller's environment.
-pub fn apply_credentials(path: impl AsRef<Path>) -> Result<usize, SetupError> {
+/// already supplied by the caller's environment. Returns the names of the
+/// variables that were actually applied — these are the only names the SIGHUP
+/// reload path is allowed to touch, so caller-set vars are never overridden.
+pub fn apply_credentials(path: impl AsRef<Path>) -> Result<Vec<String>, SetupError> {
     let path = path.as_ref();
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
             return Err(SetupError::Read {
                 path: path.to_path_buf(),
@@ -203,7 +205,7 @@ pub fn apply_credentials(path: impl AsRef<Path>) -> Result<usize, SetupError> {
         }
     };
     let file: CredentialsFile = serde_json::from_str(&contents)?;
-    let mut applied = 0;
+    let mut applied = Vec::new();
     for (name, value) in file.credentials {
         if !valid_environment_name(&name) {
             return Err(SetupError::Write {
@@ -218,28 +220,10 @@ pub fn apply_credentials(path: impl AsRef<Path>) -> Result<usize, SetupError> {
             // SAFETY: the setup file is local, validated JSON, and this only
             // mutates the current process before the async server starts.
             unsafe { std::env::set_var(&name, value) };
-            applied += 1;
+            applied.push(name);
         }
     }
     Ok(applied)
-}
-
-/// Names of the credential env vars loaded from a credentials file.
-/// Used by the SIGHUP reload path to know which vars it owns.
-pub fn load_credential_names(path: impl AsRef<Path>) -> Result<Vec<String>, SetupError> {
-    let path = path.as_ref();
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(SetupError::Read {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let file: CredentialsFile = serde_json::from_str(&contents)?;
-    Ok(file.credentials.into_keys().collect())
 }
 
 /// Reload credentials from the file, updating only the vars that were
