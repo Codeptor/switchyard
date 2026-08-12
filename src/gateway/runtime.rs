@@ -26,6 +26,16 @@ impl ListenConfig {
     pub const fn socket_addr(self) -> SocketAddr {
         SocketAddr::new(self.host, self.port)
     }
+
+    /// The gateway carries upstream credentials and has no remote auth layer;
+    /// keep the listener local until one is deliberately added.
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.host.is_loopback() {
+            Ok(())
+        } else {
+            Err("non-loopback listeners require an authenticated gateway")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -38,5 +48,11 @@ mod tests {
             ListenConfig::default().socket_addr().to_string(),
             "127.0.0.1:3456"
         );
+    }
+
+    #[test]
+    fn rejects_non_loopback_listeners_without_authentication() {
+        let listen = ListenConfig::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3456);
+        assert!(listen.validate().is_err());
     }
 }

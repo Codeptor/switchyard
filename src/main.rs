@@ -55,6 +55,10 @@ async fn main() -> Result<()> {
         cli.host.unwrap_or(defaults.host),
         cli.port.unwrap_or(defaults.port),
     );
+    listen
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("refusing to expose provider credentials on a non-loopback listener")?;
 
     info!(
         config = %config_path.display(),
