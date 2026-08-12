@@ -223,6 +223,7 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
             config_path.display()
         )
     })?;
+    let aliases = config.aliases.clone();
     let registry = Arc::new(
         config
             .into_registry()
@@ -247,7 +248,7 @@ async fn run_gateway(args: RunArgs) -> Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(listen.socket_addr()).await?;
-    Gateway::new(ProviderBackend::new(registry))
+    Gateway::new(ProviderBackend::new(registry, aliases))
         .serve_with_shutdown(listener, shutdown_signal())
         .await
         .context("Switchyard server stopped")

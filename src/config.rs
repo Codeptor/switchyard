@@ -1,5 +1,6 @@
 //! Switchyard application configuration.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub enum ConfigFileError {
 pub struct SwitchyardConfig {
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Alias → `provider/model` route. Single substitution, no chaining.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 }
 
 impl SwitchyardConfig {

@@ -345,6 +345,10 @@ pub struct MessagesRequest {
     pub metadata: Option<Value>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
+    /// Client headers forwarded from the gateway allowlist (e.g. `anthropic-beta`).
+    /// Not serialized into the upstream JSON body.
+    #[serde(skip)]
+    pub forward_headers: Vec<(String, String)>,
 }
 
 impl MessagesRequest {
@@ -457,6 +461,7 @@ mod tests {
             tool_choice: None,
             metadata: None,
             extra: BTreeMap::new(),
+            forward_headers: vec![],
         };
         assert!(req.validate().is_ok());
     }
@@ -503,5 +508,42 @@ mod tests {
         assert_eq!(output["content"][0]["type"], "thinking");
         assert_eq!(output["content"][0]["thinking"], "check the tool result");
         assert_eq!(output["content"][1]["text"], "done");
+    }
+
+    #[test]
+    fn forward_headers_not_serialized_into_body() {
+        let mut req = MessagesRequest {
+            model: "m1".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+                extra: BTreeMap::new(),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stream: None,
+            stop_sequences: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            extra: BTreeMap::new(),
+            forward_headers: vec![("anthropic-beta".to_string(), "some-beta".to_string())],
+        };
+        let output = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            output.get("forward_headers").is_none(),
+            "forward_headers must not appear in serialized JSON: {output}"
+        );
+
+        // Also verify deserialization works without the field.
+        let json_str = serde_json::to_string(&req).expect("to string");
+        let parsed: MessagesRequest = serde_json::from_str(&json_str).expect("deserialize");
+        assert!(
+            parsed.forward_headers.is_empty(),
+            "deserialized forward_headers should be empty"
+        );
     }
 }

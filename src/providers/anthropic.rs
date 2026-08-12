@@ -141,7 +141,10 @@ impl AnthropicAdapter {
         format!("{}/v1/messages", self.base_url)
     }
 
-    fn build_headers(&self) -> Result<HeaderMap, ProviderError> {
+    fn build_headers(
+        &self,
+        forward_headers: &[(String, String)],
+    ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("content-type"),
@@ -160,6 +163,16 @@ impl AnthropicAdapter {
             let header_value = HeaderValue::from_str(&value)
                 .map_err(|_| ProviderError::Config("invalid header value".to_string()))?;
             headers.insert(header_name, header_value);
+        }
+
+        // Forwarded client headers (allowlisted) — applied before extra_headers
+        // so configured extra_headers win on name conflicts.
+        for (k, v) in forward_headers {
+            let name = HeaderName::from_bytes(k.as_bytes())
+                .map_err(|_| ProviderError::Config(format!("invalid header name: {k}")))?;
+            let value = HeaderValue::from_str(v)
+                .map_err(|_| ProviderError::Config(format!("invalid header value for {k}")))?;
+            headers.insert(name, value);
         }
 
         for (k, v) in &self.extra_headers {
@@ -342,7 +355,7 @@ impl ProviderAdapter for AnthropicAdapter {
             self.validate_request(&request)?;
             request.stream = Some(false);
 
-            let headers = self.build_headers()?;
+            let headers = self.build_headers(&request.forward_headers)?;
             self.redact_for_log(&headers);
 
             let body = serde_json::to_vec(&request)
@@ -430,7 +443,7 @@ impl ProviderAdapter for AnthropicAdapter {
             self.validate_request(&request)?;
             request.stream = Some(true);
 
-            let headers = self.build_headers()?;
+            let headers = self.build_headers(&request.forward_headers)?;
             self.redact_for_log(&headers);
 
             let body = serde_json::to_vec(&request)

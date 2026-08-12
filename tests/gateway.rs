@@ -591,3 +591,77 @@ async fn invalid_request_id_is_replaced_with_generated_one() {
     assert_ne!(id, long_id);
     assert!(id.contains('-'), "looks like a uuid: {id}");
 }
+
+// ── F14: anthropic-beta header passthrough ─────────────────────────
+
+#[tokio::test]
+async fn anthropic_beta_header_is_captured_in_forward_headers() {
+    let backend = MockBackend::default();
+    let calls = Arc::clone(&backend.calls);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-beta", "prompt-caching-2024-07-31")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "kimi/kimi-k3[1m]",
+                        "messages": [{"role":"user","content":"hi"}]
+                    }))
+                    .expect("json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = calls.lock().expect("test mutex");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].forward_headers,
+        vec![(
+            "anthropic-beta".to_string(),
+            "prompt-caching-2024-07-31".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn non_allowlisted_headers_are_not_forwarded() {
+    let backend = MockBackend::default();
+    let calls = Arc::clone(&backend.calls);
+    let app = Gateway::new(backend).router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-custom-header", "should-not-forward")
+                .header("authorization", "Bearer should-not-forward")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": "kimi/kimi-k3[1m]",
+                        "messages": [{"role":"user","content":"hi"}]
+                    }))
+                    .expect("json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let calls = calls.lock().expect("test mutex");
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].forward_headers.is_empty(),
+        "non-allowlisted headers must not be forwarded"
+    );
+}

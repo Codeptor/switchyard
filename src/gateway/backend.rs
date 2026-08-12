@@ -15,6 +15,9 @@ use thiserror::Error;
 pub struct BackendRequest {
     pub model: String,
     pub body: Value,
+    /// Client headers from the allowlist that must be forwarded upstream
+    /// (currently only `anthropic-beta`).
+    pub forward_headers: Vec<(String, String)>,
 }
 
 /// A model exposed by Switchyard's local catalog.

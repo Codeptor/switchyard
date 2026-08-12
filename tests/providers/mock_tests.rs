@@ -88,6 +88,7 @@ fn sample_request(model: &str, stream: bool) -> MessagesRequest {
         tool_choice: None,
         metadata: None,
         extra: Default::default(),
+        forward_headers: vec![],
     }
 }
 
@@ -1165,4 +1166,195 @@ async fn retry_stream_path_retries_pre_stream_failure() {
 
     // 2 attempts (1 initial 503 + 1 successful retry).
     assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+// ---------------------------------------------------------------------------
+// F14: anthropic-beta header passthrough
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn adapter_forwards_anthropic_beta_header_to_upstream() {
+    let server = spawn_mock(|headers: HeaderMap, body: String| {
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(beta, "prompt-caching-2024-07-31");
+        // Also verify the body does not contain forward_headers.
+        assert!(
+            !body.contains("forward_headers"),
+            "forward_headers leaked into body: {body}"
+        );
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"ok"}],
+                "model": "m1",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":1,"output_tokens":1}
+            })
+            .to_string(),
+        )
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-fwd-beta",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(2000),
+    )
+    .expect("adapter");
+
+    let mut req = sample_request("m1", false);
+    req.forward_headers = vec![(
+        "anthropic-beta".to_string(),
+        "prompt-caching-2024-07-31".to_string(),
+    )];
+    let res = adapter.complete(req).await;
+    assert!(
+        res.is_ok(),
+        "forwarded header should arrive upstream: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn extra_headers_override_same_name_forwarded_header() {
+    let server = spawn_mock(|headers: HeaderMap, _body: String| {
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // Config extra_headers should win over forwarded header.
+        assert_eq!(beta, "config-wins");
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"ok"}],
+                "model": "m1",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":1,"output_tokens":1}
+            })
+            .to_string(),
+        )
+    })
+    .await;
+
+    let mut cfg = ProviderConfig {
+        id: "prov-override".to_string(),
+        base_url: server.base_url().parse().expect("url"),
+        auth: AuthConfig::None,
+        models: vec![],
+        connect_timeout_ms: None,
+        read_timeout_ms: Some(2000),
+        default_model: None,
+        extra_headers: vec![("anthropic-beta".to_string(), "config-wins".to_string())],
+        retry: None,
+    };
+    cfg.validate().expect("valid config");
+    let adapter = AnthropicAdapter::from_config(&cfg).expect("adapter");
+
+    let mut req = sample_request("m1", false);
+    req.forward_headers = vec![("anthropic-beta".to_string(), "client-value".to_string())];
+    let res = adapter.complete(req).await;
+    assert!(
+        res.is_ok(),
+        "extra_headers should override forwarded header: {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn forward_headers_do_not_leak_into_request_body_json() {
+    let server = spawn_mock(|_headers: HeaderMap, body: String| {
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json body");
+        assert!(
+            parsed.get("forward_headers").is_none(),
+            "forward_headers must not appear in JSON body: {body}"
+        );
+        (
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"ok"}],
+                "model": "m1",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":1,"output_tokens":1}
+            })
+            .to_string(),
+        )
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-no-leak",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(2000),
+    )
+    .expect("adapter");
+
+    let mut req = sample_request("m1", false);
+    req.forward_headers = vec![("anthropic-beta".to_string(), "some-beta".to_string())];
+    let res = adapter.complete(req).await;
+    assert!(res.is_ok(), "request should succeed: {res:?}");
+}
+
+#[tokio::test]
+async fn stream_also_forwards_anthropic_beta_header() {
+    let server = spawn_mock(|headers: HeaderMap, _body: String| {
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(beta, "interleaved-thinking-2025-05-14");
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                )
+                .to_string(),
+            ))
+            .expect("response")
+    })
+    .await;
+
+    let adapter = AnthropicAdapter::new(
+        "prov-stream-beta",
+        server.base_url(),
+        AuthConfig::None,
+        Duration::from_millis(2000),
+    )
+    .expect("adapter");
+
+    let mut req = sample_request("m1", true);
+    req.forward_headers = vec![(
+        "anthropic-beta".to_string(),
+        "interleaved-thinking-2025-05-14".to_string(),
+    )];
+    let mut stream = adapter.stream(req).await.expect("stream should start");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev.expect("event ok"));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, switchyard::providers::StreamEvent::MessageStop))
+    );
 }

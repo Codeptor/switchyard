@@ -114,7 +114,10 @@ pub fn build_config(presets: &[ProviderPreset]) -> SwitchyardConfig {
             }
             providers
         });
-    SwitchyardConfig { providers }
+    SwitchyardConfig {
+        providers,
+        aliases: BTreeMap::new(),
+    }
 }
 
 /// Errors raised while writing the first-run configuration.

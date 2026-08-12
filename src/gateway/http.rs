@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Extension, Json, State, rejection::JsonRejection};
-use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get, routing::post};
@@ -177,10 +177,13 @@ async fn models<B: Backend>(State(state): State<AppState<B>>) -> impl IntoRespon
 async fn messages<B: Backend>(
     State(state): State<AppState<B>>,
     Extension(request_id): Extension<String>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let start = Instant::now();
     let id: &str = &request_id;
+
+    let forward_headers = extract_forward_headers(&headers);
 
     let body = match payload {
         Ok(Json(body)) => body,
@@ -214,7 +217,11 @@ async fn messages<B: Backend>(
 
     info!(request_id = id, model = %model, stream = stream, "request started");
 
-    let request = BackendRequest { model, body };
+    let request = BackendRequest {
+        model,
+        body,
+        forward_headers,
+    };
     if stream {
         match state.backend.stream(request).await {
             Ok(events) => {
@@ -262,6 +269,18 @@ async fn messages<B: Backend>(
             }
         }
     }
+}
+
+/// Extract the allowlisted client headers for upstream forwarding.
+/// Currently only `anthropic-beta` is forwarded.
+fn extract_forward_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut forward = Vec::new();
+    if let Some(value) = headers.get("anthropic-beta")
+        && let Ok(s) = value.to_str()
+    {
+        forward.push(("anthropic-beta".to_string(), s.to_string()));
+    }
+    forward
 }
 
 fn validate_request(body: &Value) -> Result<(String, bool), BackendError> {

@@ -1,5 +1,6 @@
 //! Bridge from the provider registry to the Claude Code gateway port.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -15,11 +16,12 @@ use super::backend::{
 #[derive(Clone)]
 pub struct ProviderBackend {
     registry: Arc<ProviderRegistry>,
+    aliases: BTreeMap<String, String>,
 }
 
 impl ProviderBackend {
-    pub fn new(registry: Arc<ProviderRegistry>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<ProviderRegistry>, aliases: BTreeMap<String, String>) -> Self {
+        Self { registry, aliases }
     }
 
     pub fn registry(&self) -> &Arc<ProviderRegistry> {
@@ -29,7 +31,8 @@ impl ProviderBackend {
 
 impl Backend for ProviderBackend {
     fn models(&self) -> Vec<ModelInfo> {
-        self.registry
+        let mut models: Vec<ModelInfo> = self
+            .registry
             .provider_ids()
             .into_iter()
             .flat_map(|provider_id| {
@@ -39,17 +42,23 @@ impl Backend for ProviderBackend {
                     .iter()
                     .map(move |model_id| ModelInfo::new(format!("{provider_id}/{model_id}")))
             })
-            .collect()
+            .collect();
+        for alias in self.aliases.keys() {
+            models.push(ModelInfo::new(alias.clone()));
+        }
+        models
     }
 
-    fn complete(&self, request: BackendRequest) -> BackendFuture<'_, Value> {
+    fn complete(&self, mut request: BackendRequest) -> BackendFuture<'_, Value> {
+        let aliases = self.aliases.clone();
         Box::pin(async move {
+            resolve_alias(&mut request, &aliases);
             let (provider_id, model_id) = split_model_id(&request.model)?;
             let handle = self
                 .registry
                 .resolve(provider_id, Some(model_id))
                 .map_err(map_provider_error)?;
-            let typed_request = parse_request(request.body, &handle.model_id)?;
+            let typed_request = parse_request(&request, &handle.model_id)?;
             let response = handle
                 .adapter
                 .complete(typed_request)
@@ -61,14 +70,16 @@ impl Backend for ProviderBackend {
         })
     }
 
-    fn stream(&self, request: BackendRequest) -> BackendFuture<'_, BackendStream> {
+    fn stream(&self, mut request: BackendRequest) -> BackendFuture<'_, BackendStream> {
+        let aliases = self.aliases.clone();
         Box::pin(async move {
+            resolve_alias(&mut request, &aliases);
             let (provider_id, model_id) = split_model_id(&request.model)?;
             let handle = self
                 .registry
                 .resolve(provider_id, Some(model_id))
                 .map_err(map_provider_error)?;
-            let typed_request = parse_request(request.body, &handle.model_id)?;
+            let typed_request = parse_request(&request, &handle.model_id)?;
             let provider_stream = handle
                 .adapter
                 .stream(typed_request)
@@ -86,6 +97,14 @@ impl Backend for ProviderBackend {
     }
 }
 
+/// Substitute the request model with the alias target if it matches.
+/// Single substitution, no chained resolution.
+fn resolve_alias(request: &mut BackendRequest, aliases: &BTreeMap<String, String>) {
+    if let Some(target) = aliases.get(&request.model) {
+        request.model = target.clone();
+    }
+}
+
 fn split_model_id(model: &str) -> Result<(&str, &str), BackendError> {
     let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
         BackendError::ModelUnavailable(format!(
@@ -100,14 +119,20 @@ fn split_model_id(model: &str) -> Result<(&str, &str), BackendError> {
     Ok((provider_id, model_id))
 }
 
-fn parse_request(body: Value, model_id: &str) -> Result<MessagesRequest, BackendError> {
-    let mut object = body.as_object().cloned().ok_or_else(|| {
+fn parse_request(
+    request: &BackendRequest,
+    model_id: &str,
+) -> Result<MessagesRequest, BackendError> {
+    let mut object = request.body.as_object().cloned().ok_or_else(|| {
         BackendError::InvalidRequest("request body must be a JSON object".to_string())
     })?;
     object.insert("model".to_string(), Value::String(model_id.to_string()));
-    serde_json::from_value(Value::Object(object)).map_err(|error| {
-        BackendError::InvalidRequest(format!("invalid Anthropic Messages request: {error}"))
-    })
+    let mut typed: MessagesRequest =
+        serde_json::from_value(Value::Object(object)).map_err(|error| {
+            BackendError::InvalidRequest(format!("invalid Anthropic Messages request: {error}"))
+        })?;
+    typed.forward_headers = request.forward_headers.clone();
+    Ok(typed)
 }
 
 fn map_provider_error(error: ProviderError) -> BackendError {
