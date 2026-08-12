@@ -24,7 +24,7 @@ pub mod types;
 // Re-exports for Codex boundary.
 pub use adapter::{ProviderAdapter, ResolvedModel};
 pub use anthropic::AnthropicAdapter;
-pub use config::{AuthConfig, ModelCapabilities, ModelConfig, ProviderConfig};
+pub use config::{AuthConfig, ModelCapabilities, ModelConfig, ProviderConfig, RetryConfig};
 pub use credentials::{load_credential, redact_headers};
 pub use error::{ProviderError, UpstreamErrorDetails};
 pub use registry::ProviderRegistry;

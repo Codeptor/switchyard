@@ -24,10 +24,14 @@ pub enum ConfigError {
     DuplicateProviderId(String),
     #[error("duplicate model id in provider {provider}: {model}")]
     DuplicateModelId { provider: String, model: String },
-    #[error("timeout_ms must be > 0, got {0}")]
-    InvalidTimeout(u64),
+    #[error("connect_timeout_ms must be > 0, got {0}")]
+    InvalidConnectTimeout(u64),
+    #[error("read_timeout_ms must be > 0, got {0}")]
+    InvalidReadTimeout(u64),
     #[error("default_model '{0}' not found in provider models")]
     DefaultModelNotFound(String),
+    #[error("retry config invalid: {0}")]
+    InvalidRetry(String),
 }
 
 /// Authentication configuration. Generic over providers.
@@ -119,6 +123,65 @@ impl ModelConfig {
     }
 }
 
+/// Retry configuration for upstream requests.
+///
+/// Retries are applied only before the first upstream byte arrives.
+/// Once a stream begins, no further retries occur.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts (default: 2).
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff (default: 250).
+    #[serde(default = "default_base_delay_ms")]
+    pub base_delay_ms: u64,
+    /// Maximum delay cap in milliseconds (default: 5000).
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+fn default_max_retries() -> u32 {
+    2
+}
+fn default_base_delay_ms() -> u64 {
+    250
+}
+fn default_max_delay_ms() -> u64 {
+    5000
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            base_delay_ms: default_base_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+        }
+    }
+}
+
+impl RetryConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.base_delay_ms == 0 {
+            return Err(ConfigError::InvalidRetry(
+                "base_delay_ms must be > 0".to_string(),
+            ));
+        }
+        if self.max_delay_ms == 0 {
+            return Err(ConfigError::InvalidRetry(
+                "max_delay_ms must be > 0".to_string(),
+            ));
+        }
+        if self.max_delay_ms < self.base_delay_ms {
+            return Err(ConfigError::InvalidRetry(format!(
+                "max_delay_ms ({}) must be >= base_delay_ms ({})",
+                self.max_delay_ms, self.base_delay_ms
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Provider-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
@@ -131,12 +194,21 @@ pub struct ProviderConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    /// TCP connect timeout in milliseconds (default: 10000).
     #[serde(default)]
-    pub timeout_ms: Option<u64>,
+    pub connect_timeout_ms: Option<u64>,
+    /// Per-read idle timeout in milliseconds (default: 120000).
+    /// Applies per socket read operation — an idle gap longer than this aborts,
+    /// but a long healthy stream is not killed.
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
     #[serde(default)]
     pub default_model: Option<String>,
     #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+    /// Retry configuration. `None` uses the default (2 retries, 250ms base, 5s cap).
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
 }
 
 impl ProviderConfig {
@@ -169,10 +241,19 @@ impl ProviderConfig {
 
         self.auth.validate()?;
 
-        if let Some(ms) = self.timeout_ms
+        if let Some(ms) = self.connect_timeout_ms
             && ms == 0
         {
-            return Err(ConfigError::InvalidTimeout(ms));
+            return Err(ConfigError::InvalidConnectTimeout(ms));
+        }
+        if let Some(ms) = self.read_timeout_ms
+            && ms == 0
+        {
+            return Err(ConfigError::InvalidReadTimeout(ms));
+        }
+
+        if let Some(retry) = &self.retry {
+            retry.validate()?;
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -321,9 +402,11 @@ mod tests {
             base_url: url("https://example.com"),
             auth: AuthConfig::None,
             models: vec![],
-            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
             default_model: None,
             extra_headers: vec![],
+            retry: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -335,9 +418,11 @@ mod tests {
             base_url: url("https://example.com"),
             auth: AuthConfig::None,
             models: vec![],
-            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
             default_model: None,
             extra_headers: vec![],
+            retry: None,
         };
         assert!(provider.validate().is_err());
 
@@ -352,9 +437,11 @@ mod tests {
                 max_output_tokens: None,
                 capabilities: ModelCapabilities::default(),
             }],
-            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
             default_model: None,
             extra_headers: vec![],
+            retry: None,
         };
         assert!(model.validate().is_err());
     }
@@ -366,9 +453,11 @@ mod tests {
             base_url: url("https://example.com/"),
             auth: AuthConfig::None,
             models: vec![],
-            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
             default_model: None,
             extra_headers: vec![],
+            retry: None,
         };
         assert_eq!(cfg.normalized_base_url(), "https://example.com");
     }

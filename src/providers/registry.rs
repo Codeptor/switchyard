@@ -209,9 +209,11 @@ mod tests {
                     capabilities: ModelCapabilities::default(),
                 })
                 .collect(),
-            timeout_ms: Some(2000),
+            connect_timeout_ms: None,
+            read_timeout_ms: Some(2000),
             default_model: None,
             extra_headers: vec![],
+            retry: None,
         }
     }
 

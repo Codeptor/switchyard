@@ -11,7 +11,14 @@
       },
       "models": [
         { "id": "kimi-k3[1m]" }
-      ]
+      ],
+      "connect_timeout_ms": 10000,
+      "read_timeout_ms": 120000,
+      "retry": {
+        "max_retries": 2,
+        "base_delay_ms": 250,
+        "max_delay_ms": 5000
+      }
     },
     {
       "id": "muse",
